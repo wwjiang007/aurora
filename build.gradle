@@ -17,7 +17,7 @@ plugins {
   id 'com.github.hierynomus.license' version '0.11.0'
   id 'com.moowork.node' version '1.2.0'
   id 'me.champeau.gradle.jmh' version '0.4.4'
-  id "com.github.spotbugs" version "1.6.0"
+  id "com.github.spotbugs" version "1.6.4"
 }
 
 apply plugin: 'application'
@@ -90,7 +90,7 @@ For more details, please see https://issues.apache.org/jira/browse/AURORA-1169
   ext.junitRev = '4.12'
   ext.logbackRev = '1.2.3'
   ext.nettyRev = '4.0.52.Final'
-  ext.protobufRev = '3.3.0'
+  ext.protobufRev = '3.5.1'
   ext.resteasyRev = '3.1.4.Final'
   ext.servletRev = '3.1.0'
   ext.slf4jRev = '1.7.25'
@@ -139,9 +139,10 @@ project(':ui') {
   apply plugin: 'com.moowork.node'
   node {
     download = true
+    version = '12.14.1'
   }
 
-  task test(type: NpmTask, overwrite: true) {
+  task test_(type: NpmTask, overwrite: true) {
     inputs.files(fileTree('src'), fileTree('plugin'))
     outputs.files(fileTree('dist'))
     args = ['test']
@@ -390,7 +391,7 @@ dependencies {
   compile "org.apache.curator:curator-client:${curatorRev}"
   compile "org.apache.curator:curator-framework:${curatorRev}"
   compile "org.apache.curator:curator-recipes:${curatorRev}"
-  compile 'org.apache.mesos:mesos:1.4.0'
+  compile 'org.apache.mesos:mesos:1.6.1'
   compile "org.asynchttpclient:async-http-client:${asyncHttpclientRev}"
   compile "org.apache.shiro:shiro-guice:${shiroRev}"
   compile "org.apache.shiro:shiro-web:${shiroRev}"

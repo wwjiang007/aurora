@@ -1,5 +1,97 @@
-0.20.0 (unreleased)
-===================
+0.22.0
+======
+
+### New/updated:
+- Updated to Mesos 1.6.1.
+- New update strategy added: Variable Batch Update. With this strategy, a job may be updated in
+  in batches of different sizes. For example, an update which modifies a total of 10 instances may
+  be done in batch sizes of 2, 3, and 5. The number of updated instances must equal the size of the
+  current group size in order to move to the next group size. If the number of updated instances is
+  greater to the sum of all group sizes, the last group size will be used in perpetuity until all
+  instances are updated.
+  A new field has been added to `UpdateConfig` called `update_strategy`.
+  Update strategy may take a `QueueUpdateStrategy`, `BatchUpdateStrategy`,
+  or a `VariableBatchUpdateStrategy` object. `QueueUpdateStrategy` and `BatchUpdateStrategy` take
+  a single integer argument while `VariableBatchUpdateStrategy` takes a list of positive integers
+  as an argument.
+- Users may now set a value for the URI fetcher to rename a downloaded artifact to after it
+  has been downloaded.
+- Auto pause feature added to VariableBatch strategy and Batch strategy. With this feature enabled,
+  when an update is `ROLLING_FORWARD`, the update will automatically pause itself right before
+  a new batch is started. (This feature is being released as tested but in beta state. We are
+  looking to collect feedback before we consider it fully stable.)
+- `loader.load()` now uses memoization on the config file path so that we only load and process
+  each config file once.
+- Instances run with custom executors will no longer show links to thermos observer.
+- Add observer command line option `--disable_task_resource_collection` to disable the collection of
+  CPU, memory, and disk metrics for observed tasks. This is useful in setups where metrics cannot be
+  gathered reliable (e.g. when using PID namespaces) or when it is expensive due to hundreds of
+  active tasks per host.
+- Added flag `-sla_aware_kill_non_prod` which allows operators to enable SLA aware killing
+  for non-production jobs. Jobs are considered non-production when they are preemptable and/or
+  revocable.
+
+### Deprecations and removals:
+
+- Deprecated use of Thrift fields `JobUpdateSettings.waitForBatchCompletion` and
+  `JobUpdateSettings.updateGroupSize`. Please set the proper `JobUpdateSettings.updateStrategy`
+  instead. Note that these same constructs, as represented in the Aurora DSL, are still valid
+  as they will be converted to the new field automatically by the client
+  for backwards compatibility.
+- Backfill code for finding a matching tier to for a Job has been removed. Tier will now be set
+  when a Job is received by the scheduler. If no tier is provided, the default tier defined in
+  `-tier_config`.
+
+0.21.0
+======
+
+### New/updated:
+- Updated to Mesos 1.5.0.
+- Introduce ability for tasks to specify custom SLA requirements via the new `SlaPolicy` structs.
+  There are 3 different SLA Policies that are currently supported - `CountSlaPolicy`,
+  `PercentageSlaPolicy` and `CoordinatorSlaPolicy`. SLA policies based on count and percentage
+  express the required number of `RUNNING` instances as either a count or percentage in addition to
+  allowing the duration-window for which these requirements have to be satisfied. For applications
+  that need more control over how SLA is determined, a custom SLA calculator can be configured a.k.a
+  Coordinator. Any action that can affect SLA, will first check with the Coordinator before
+  proceeding.
+
+    **IMPORTANT: The storage changes required for this feature will make scheduler
+    snapshot backwards incompatible. Scheduler will be unable to read snapshot if rolled back to
+    previous version. If rollback is absolutely necessary, perform the following steps:**
+    1. Stop all host maintenance requests via `aurora_admin host_activate`.
+    2. Ensure a new snapshot is created by running `aurora_admin scheduler_snapshot <cluster>`
+    3. Rollback to previous version
+
+  Note: The `Coordinator` interface required for the `CoordinatorSlaPolicy` is experimental at
+  this juncture and is bound to change in the future.
+- Introduced ability for updates to be 'SLA-aware', or only update instances if it is within SLA,
+  using the new `sla_aware` field in `UpdateConfig`. See the bullet point above for an explanation
+  of custom SLA requirements.
+
+  **NOTE**: SLA-aware updates will use the desired config's SLA, not the existing config.
+
+  Three additional scheduler options have been added to support this feature:
+
+    1. `max_update_action_batch_size (default: 300)`: the number of update actions to process in a
+    batch.
+    2. `sla_aware_kill_retry_min_delay (default: 1mins)`: the minimum amount of time to wait before
+    retrying an SLA-aware kill (using a truncated binary backoff).
+    3. `sla_aware_kill_retry_max_delay (default: 5mins)`: the maximum amount of time to wait before
+    retrying an SLA-aware kill (using a truncated binary backoff).
+
+### Deprecations and removals:
+
+- Deprecated the `aurora_admin host_drain` command used for maintenance. With this release the SLA
+  computations are moved to the scheduler and it is no longer required for the client to compute
+  SLAs and watch the drains. The scheduler persists any host maintenance request and performs
+  SLA-aware drain of the tasks, before marking the host as `DRAINED`. So maintenance requests
+  survive across scheduler fail-overs. Use the newly introduced `aurora_admin sla_host_drain`
+  to skip the SLA computations on the admin client.
+- Removed resource fields (`numCpus`, `ramMb`, `diskMb`) from ResourceAggregate.
+
+0.20.0
+======
 
 ### New/updated:
 
@@ -15,6 +107,15 @@
 - Added the ability to inject custom offer holding and scheduling logic via the `-offer_set_module`
   scheduler flag. To take advantage of this feature, you will need to implement the `OfferSet`
   interface.
+- Added `executor_config` field to the Job object of the DSL which will populate
+  `JobConfiguration.TaskConfig.ExecutorConfig`. This allows for using custom executors defined
+  through the `--custom_executor_config` scheduler flag. See our
+  [custom-executors](docs/features/custom-executors.md) documentation for more information.
+- Added support in Thermos Observer for delegating disk usage monitoring to Mesos agent. The feature
+  can be enabled via `--enable_mesos_disk_collector` flag, in which case Observer will use the
+  agent's containers HTTP API to query the amount of used bytes for each container. Note that disk
+  isolation should be enabled in Mesos agent. This feature is not compatible with authentication
+  enabled agents.
 
 ### Deprecations and removals:
 

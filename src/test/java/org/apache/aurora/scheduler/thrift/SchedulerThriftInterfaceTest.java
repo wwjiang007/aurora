@@ -32,6 +32,7 @@ import org.apache.aurora.gen.AssignedTask;
 import org.apache.aurora.gen.AuroraAdmin;
 import org.apache.aurora.gen.Constraint;
 import org.apache.aurora.gen.Container;
+import org.apache.aurora.gen.CoordinatorSlaPolicy;
 import org.apache.aurora.gen.ExecutorConfig;
 import org.apache.aurora.gen.ExplicitReconciliationSettings;
 import org.apache.aurora.gen.HostStatus;
@@ -44,14 +45,17 @@ import org.apache.aurora.gen.JobUpdatePulseStatus;
 import org.apache.aurora.gen.JobUpdateQuery;
 import org.apache.aurora.gen.JobUpdateRequest;
 import org.apache.aurora.gen.JobUpdateSettings;
+import org.apache.aurora.gen.JobUpdateStrategy;
 import org.apache.aurora.gen.JobUpdateSummary;
 import org.apache.aurora.gen.LimitConstraint;
 import org.apache.aurora.gen.ListBackupsResult;
 import org.apache.aurora.gen.MaintenanceMode;
 import org.apache.aurora.gen.MesosContainer;
 import org.apache.aurora.gen.Metadata;
+import org.apache.aurora.gen.PercentageSlaPolicy;
 import org.apache.aurora.gen.PulseJobUpdateResult;
 import org.apache.aurora.gen.QueryRecoveryResult;
+import org.apache.aurora.gen.QueueJobUpdateStrategy;
 import org.apache.aurora.gen.Range;
 import org.apache.aurora.gen.ReadOnlyScheduler;
 import org.apache.aurora.gen.Resource;
@@ -62,11 +66,13 @@ import org.apache.aurora.gen.ResponseDetail;
 import org.apache.aurora.gen.Result;
 import org.apache.aurora.gen.ScheduleStatus;
 import org.apache.aurora.gen.ScheduledTask;
+import org.apache.aurora.gen.SlaPolicy;
 import org.apache.aurora.gen.StartJobUpdateResult;
 import org.apache.aurora.gen.TaskConfig;
 import org.apache.aurora.gen.TaskConstraint;
 import org.apache.aurora.gen.TaskQuery;
 import org.apache.aurora.gen.ValueConstraint;
+import org.apache.aurora.gen.VariableBatchJobUpdateStrategy;
 import org.apache.aurora.gen.apiConstants;
 import org.apache.aurora.scheduler.base.Query;
 import org.apache.aurora.scheduler.base.TaskTestUtil;
@@ -77,10 +83,10 @@ import org.apache.aurora.scheduler.configuration.SanitizedConfiguration;
 import org.apache.aurora.scheduler.cron.CronException;
 import org.apache.aurora.scheduler.cron.CronJobManager;
 import org.apache.aurora.scheduler.cron.SanitizedCronJob;
+import org.apache.aurora.scheduler.maintenance.MaintenanceController;
 import org.apache.aurora.scheduler.quota.QuotaCheckResult;
 import org.apache.aurora.scheduler.quota.QuotaManager;
 import org.apache.aurora.scheduler.reconciliation.TaskReconciler;
-import org.apache.aurora.scheduler.state.MaintenanceController;
 import org.apache.aurora.scheduler.state.StateChangeResult;
 import org.apache.aurora.scheduler.state.StateManager;
 import org.apache.aurora.scheduler.state.UUIDGenerator;
@@ -147,12 +153,14 @@ import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.CREATE
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.CREATE_OR_UPDATE_CRON;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.DRAIN_HOSTS;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.END_MAINTENANCE;
+import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.INVALID_SLA_AWARE_UPDATE;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.KILL_TASKS;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.MAINTENANCE_STATUS;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.NOOP_JOB_UPDATE_MESSAGE;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.NO_CRON;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.PRUNE_TASKS;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.RESTART_SHARDS;
+import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.SLA_DRAIN_HOSTS;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.START_JOB_UPDATE;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.START_MAINTENANCE;
 import static org.apache.aurora.scheduler.thrift.SchedulerThriftInterface.jobAlreadyExistsMessage;
@@ -558,11 +566,23 @@ public class SchedulerThriftInterfaceTest extends EasyMockTest {
   }
 
   private IScheduledTask buildTaskForJobUpdate(int instanceId, String executorData) {
+    return buildTaskForJobUpdate(
+        instanceId,
+        executorData,
+        Optional.of(SlaPolicy.coordinatorSlaPolicy(
+            new CoordinatorSlaPolicy("test-url", "test-key"))));
+  }
+
+  private IScheduledTask buildTaskForJobUpdate(int instanceId,
+                                               String executorData,
+                                               Optional<SlaPolicy> slaPolicy) {
+
     return IScheduledTask.build(new ScheduledTask()
         .setAssignedTask(new AssignedTask()
             .setInstanceId(instanceId)
             .setTask(populatedTask()
                 .setIsService(true)
+                .setSlaPolicy(slaPolicy.orElse(null))
                 .setExecutorConfig(new ExecutorConfig().setName(EXECUTOR_NAME)
                     .setData(executorData)))));
   }
@@ -727,13 +747,10 @@ public class SchedulerThriftInterfaceTest extends EasyMockTest {
   @Test
   public void testSetQuota() throws Exception {
     ResourceAggregate resourceAggregate = new ResourceAggregate()
-        .setNumCpus(10)
-        .setDiskMb(100)
-        .setRamMb(200);
+        .setResources(ImmutableSet.of(numCpus(10.0), ramMb(200), diskMb(100)));
     quotaManager.saveQuota(
         ROLE,
-        IResourceAggregate.build(resourceAggregate.deepCopy()
-            .setResources(ImmutableSet.of(numCpus(10), ramMb(200), diskMb(100)))),
+        IResourceAggregate.build(resourceAggregate),
         storageUtil.mutableStoreProvider);
 
     control.replay();
@@ -744,9 +761,7 @@ public class SchedulerThriftInterfaceTest extends EasyMockTest {
   @Test
   public void testSetQuotaFails() throws Exception {
     ResourceAggregate resourceAggregate = new ResourceAggregate()
-        .setNumCpus(10)
-        .setDiskMb(100)
-        .setRamMb(200);
+        .setResources(ImmutableSet.of(numCpus(10.0), ramMb(200), diskMb(100)));
     quotaManager.saveQuota(
         ROLE,
         IResourceAggregate.build(resourceAggregate.deepCopy()
@@ -1097,6 +1112,59 @@ public class SchedulerThriftInterfaceTest extends EasyMockTest {
     assertEquals(1L, statsProvider.getLongValue(END_MAINTENANCE));
   }
 
+  @Test
+  public void testSLAHostMaintenance() throws Exception {
+    Set<String> hostnames = ImmutableSet.of("a");
+    SlaPolicy defaultSlaPolicy = SlaPolicy.percentageSlaPolicy(
+        new PercentageSlaPolicy().setPercentage(95));
+    Set<IHostStatus> none = status("a", NONE);
+    Set<IHostStatus> scheduled = status("a", SCHEDULED);
+    Set<IHostStatus> draining = status("a", DRAINING);
+    Set<IHostStatus> drained = status("a", DRAINING);
+    expect(maintenance.getStatus(hostnames)).andReturn(none);
+    expect(maintenance.startMaintenance(hostnames)).andReturn(scheduled);
+    expect(maintenance.slaDrain(hostnames, defaultSlaPolicy, 10)).andReturn(draining);
+    expect(maintenance.getStatus(hostnames)).andReturn(draining);
+    expect(maintenance.getStatus(hostnames)).andReturn(drained);
+    expect(maintenance.endMaintenance(hostnames)).andReturn(none);
+
+    control.replay();
+
+    Hosts hosts = new Hosts(hostnames);
+
+    assertEquals(
+        IHostStatus.toBuildersSet(none),
+        thrift.maintenanceStatus(hosts).getResult().getMaintenanceStatusResult()
+            .getStatuses());
+    assertEquals(1L, statsProvider.getLongValue(MAINTENANCE_STATUS));
+    assertEquals(
+        IHostStatus.toBuildersSet(scheduled),
+        thrift.startMaintenance(hosts).getResult().getStartMaintenanceResult()
+            .getStatuses());
+    assertEquals(1L, statsProvider.getLongValue(START_MAINTENANCE));
+    assertEquals(
+        IHostStatus.toBuildersSet(draining),
+        thrift.slaDrainHosts(hosts, defaultSlaPolicy, 10)
+            .getResult()
+            .getDrainHostsResult()
+            .getStatuses());
+    assertEquals(1L, statsProvider.getLongValue(SLA_DRAIN_HOSTS));
+    assertEquals(
+        IHostStatus.toBuildersSet(draining),
+        thrift.maintenanceStatus(hosts).getResult().getMaintenanceStatusResult()
+            .getStatuses());
+    assertEquals(2L, statsProvider.getLongValue(MAINTENANCE_STATUS));
+    assertEquals(
+        IHostStatus.toBuildersSet(drained),
+        thrift.maintenanceStatus(hosts).getResult().getMaintenanceStatusResult()
+            .getStatuses());
+    assertEquals(3L, statsProvider.getLongValue(MAINTENANCE_STATUS));
+    assertEquals(
+        IHostStatus.toBuildersSet(none),
+        thrift.endMaintenance(hosts).getResult().getEndMaintenanceResult().getStatuses());
+    assertEquals(1L, statsProvider.getLongValue(END_MAINTENANCE));
+  }
+
   private static Response okEmptyResponse() {
     return response(OK, Optional.empty());
   }
@@ -1410,11 +1478,42 @@ public class SchedulerThriftInterfaceTest extends EasyMockTest {
     control.replay();
 
     JobUpdateRequest updateRequest = buildServiceJobUpdateRequest();
-    updateRequest.getSettings().setUpdateGroupSize(0);
+    updateRequest.getSettings().setUpdateStrategy(
+        JobUpdateStrategy.queueStrategy(new QueueJobUpdateStrategy().setGroupSize(0)));
 
     assertEquals(
-        invalidResponse(SchedulerThriftInterface.INVALID_GROUP_SIZE),
+        invalidResponse(SchedulerThriftInterface.NO_INSTANCES_MODIFIED),
         thrift.startJobUpdate(updateRequest, AUDIT_MESSAGE));
+    assertEquals(0L, statsProvider.getLongValue(START_JOB_UPDATE));
+  }
+
+  @Test
+  public void testStartUpdateFailsInvalidGroupSizeVariableBatch() throws Exception {
+    control.replay();
+
+    JobUpdateRequest updateRequest = buildServiceJobUpdateRequest();
+    updateRequest.getSettings().setUpdateStrategy(
+            JobUpdateStrategy.varBatchStrategy(
+                    new VariableBatchJobUpdateStrategy().setGroupSizes(ImmutableList.of(1, 0, 4))));
+
+    assertEquals(
+            invalidResponse(SchedulerThriftInterface.INVALID_GROUP_SIZE),
+            thrift.startJobUpdate(updateRequest, AUDIT_MESSAGE));
+    assertEquals(0L, statsProvider.getLongValue(START_JOB_UPDATE));
+  }
+
+  @Test
+  public void testStartUpdateFailsInvalidGroupsSum() throws Exception {
+    control.replay();
+
+    JobUpdateRequest updateRequest = buildServiceJobUpdateRequest();
+    updateRequest.getSettings().setUpdateStrategy(
+            JobUpdateStrategy.varBatchStrategy(
+                    new VariableBatchJobUpdateStrategy().setGroupSizes(ImmutableList.of())));
+
+    assertEquals(
+            invalidResponse(SchedulerThriftInterface.NO_INSTANCES_MODIFIED),
+            thrift.startJobUpdate(updateRequest, AUDIT_MESSAGE));
     assertEquals(0L, statsProvider.getLongValue(START_JOB_UPDATE));
   }
 
@@ -1694,6 +1793,27 @@ public class SchedulerThriftInterfaceTest extends EasyMockTest {
   }
 
   @Test
+  public void testStartUpdateFailsWhenSlaAwareWithNoPolicy() throws Exception {
+    IScheduledTask oldTask = buildTaskForJobUpdate(0, "old");
+    ITaskConfig newTask = buildTaskForJobUpdate(0, "new", Optional.empty())
+        .getAssignedTask()
+        .getTask();
+
+    IJobUpdate update = buildJobUpdate(
+        1,
+        newTask,
+        ImmutableMap.of(oldTask.getAssignedTask().getTask(), ImmutableSet.of(new Range(0, 0))),
+        buildJobUpdateSettings().setSlaAware(true));
+
+    control.replay();
+
+    JobUpdateRequest request = buildJobUpdateRequest(update);
+    Response response = thrift.startJobUpdate(request, AUDIT_MESSAGE);
+    assertEquals(invalidResponse(INVALID_SLA_AWARE_UPDATE), response);
+    assertEquals(0L, statsProvider.getLongValue(START_JOB_UPDATE));
+  }
+
+  @Test
   public void testPauseJobUpdateByCoordinator() throws Exception {
     expectGetRemoteUser();
     jobUpdateController.pause(UPDATE_KEY, AUDIT);
@@ -1876,6 +1996,8 @@ public class SchedulerThriftInterfaceTest extends EasyMockTest {
   private static JobUpdateSettings buildJobUpdateSettings() {
     return new JobUpdateSettings()
         .setUpdateGroupSize(10)
+        .setUpdateStrategy(
+            JobUpdateStrategy.queueStrategy(new QueueJobUpdateStrategy().setGroupSize(10)))
         .setMaxFailedInstances(2)
         .setMaxPerInstanceFailures(1)
         .setMinWaitInInstanceRunningMs(15000)
@@ -1905,6 +2027,15 @@ public class SchedulerThriftInterfaceTest extends EasyMockTest {
       ITaskConfig newConfig,
       ImmutableMap<ITaskConfig, ImmutableSet<Range>> oldConfigMap) {
 
+    return buildJobUpdate(instanceCount, newConfig, oldConfigMap, buildJobUpdateSettings());
+  }
+
+  private static IJobUpdate buildJobUpdate(
+      int instanceCount,
+      ITaskConfig newConfig,
+      ImmutableMap<ITaskConfig, ImmutableSet<Range>> oldConfigMap,
+      JobUpdateSettings jobUpdateSettings) {
+
     ImmutableSet.Builder<InstanceTaskConfig> builder = ImmutableSet.builder();
     for (Map.Entry<ITaskConfig, ImmutableSet<Range>> entry : oldConfigMap.entrySet()) {
       builder.add(new InstanceTaskConfig(entry.getKey().newBuilder(), entry.getValue()));
@@ -1916,7 +2047,7 @@ public class SchedulerThriftInterfaceTest extends EasyMockTest {
             .setUser(IDENTITY.getUser())
             .setMetadata(METADATA))
         .setInstructions(new JobUpdateInstructions()
-            .setSettings(buildJobUpdateSettings())
+            .setSettings(jobUpdateSettings)
             .setDesiredState(new InstanceTaskConfig()
                 .setTask(newConfig.newBuilder())
                 .setInstances(ImmutableSet.of(new Range(0, instanceCount - 1))))

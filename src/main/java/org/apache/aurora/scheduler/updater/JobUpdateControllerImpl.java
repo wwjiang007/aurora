@@ -16,10 +16,12 @@ package org.apache.aurora.scheduler.updater;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
@@ -30,7 +32,6 @@ import com.google.common.base.Functions;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
-import com.google.common.collect.FluentIterable;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
@@ -69,6 +70,7 @@ import org.apache.aurora.scheduler.storage.entities.IJobUpdateEvent;
 import org.apache.aurora.scheduler.storage.entities.IJobUpdateInstructions;
 import org.apache.aurora.scheduler.storage.entities.IJobUpdateKey;
 import org.apache.aurora.scheduler.storage.entities.IJobUpdateQuery;
+import org.apache.aurora.scheduler.storage.entities.IJobUpdateStrategy;
 import org.apache.aurora.scheduler.storage.entities.IJobUpdateSummary;
 import org.apache.aurora.scheduler.storage.entities.IScheduledTask;
 import org.apache.aurora.scheduler.updater.StateEvaluator.Failure;
@@ -101,6 +103,7 @@ import static org.apache.aurora.scheduler.updater.JobUpdateStateMachine.MonitorA
 import static org.apache.aurora.scheduler.updater.JobUpdateStateMachine.MonitorAction.STOP_WATCHING;
 import static org.apache.aurora.scheduler.updater.JobUpdateStateMachine.assertTransitionAllowed;
 import static org.apache.aurora.scheduler.updater.JobUpdateStateMachine.getBlockedState;
+import static org.apache.aurora.scheduler.updater.JobUpdateStateMachine.getPausedState;
 import static org.apache.aurora.scheduler.updater.OneWayJobUpdater.EvaluationResult;
 import static org.apache.aurora.scheduler.updater.OneWayJobUpdater.OneWayStatus;
 import static org.apache.aurora.scheduler.updater.OneWayJobUpdater.OneWayStatus.SUCCEEDED;
@@ -116,6 +119,7 @@ class JobUpdateControllerImpl implements JobUpdateController {
   private static final Logger LOG = LoggerFactory.getLogger(JobUpdateControllerImpl.class);
   private static final String FATAL_ERROR_FORMAT =
       "Unexpected problem running asynchronous updater for: %s. Triggering shutdown";
+  private static final String UPDATE_AUTO_PAUSED = "Update auto paused";
 
   private final UpdateFactory updateFactory;
   private final Storage storage;
@@ -124,13 +128,18 @@ class JobUpdateControllerImpl implements JobUpdateController {
   private final Clock clock;
   private final PulseHandler pulseHandler;
   private final Lifecycle lifecycle;
-  private final TaskEventBatchWorker batchWorker;
+  private final TaskEventBatchWorker taskEventBatchWorker;
   private final UpdateAgentReserver updateAgentReserver;
+  private final SlaKillController slaKillController;
 
   // Currently-active updaters. An active updater is one that is rolling forward or back. Paused
   // and completed updates are represented only in storage, not here.
   private final Map<IJobKey, UpdateFactory.Update> updates =
       Collections.synchronizedMap(Maps.newHashMap());
+
+  // Used only for updates that have auto pause enabled. Keeps track of what instances
+  // have already been seen by the updater in order to detect when a new batch is started.
+  private final Map<IJobUpdateKey, Set<Integer>> instancesSeen = new ConcurrentHashMap<>();
 
   private final LoadingCache<JobUpdateStatus, AtomicLong> jobUpdateEventStats;
   private final LoadingCache<JobUpdateAction, AtomicLong> jobUpdateActionStats;
@@ -144,8 +153,9 @@ class JobUpdateControllerImpl implements JobUpdateController {
       UpdateAgentReserver updateAgentReserver,
       Clock clock,
       Lifecycle lifecycle,
-      TaskEventBatchWorker batchWorker,
-      StatsProvider statsProvider) {
+      TaskEventBatchWorker taskEventBatchWorker,
+      StatsProvider statsProvider,
+      SlaKillController slaKillController) {
 
     this.updateFactory = requireNonNull(updateFactory);
     this.storage = requireNonNull(storage);
@@ -153,9 +163,10 @@ class JobUpdateControllerImpl implements JobUpdateController {
     this.stateManager = requireNonNull(stateManager);
     this.clock = requireNonNull(clock);
     this.lifecycle = requireNonNull(lifecycle);
-    this.batchWorker = requireNonNull(batchWorker);
+    this.taskEventBatchWorker = requireNonNull(taskEventBatchWorker);
     this.pulseHandler = new PulseHandler(clock);
     this.updateAgentReserver = requireNonNull(updateAgentReserver);
+    this.slaKillController = requireNonNull(slaKillController);
 
     this.jobUpdateEventStats = CacheBuilder.newBuilder()
         .build(new CacheLoader<JobUpdateStatus, AtomicLong>() {
@@ -265,9 +276,8 @@ class JobUpdateControllerImpl implements JobUpdateController {
       }
 
       IJobUpdate update = details.get().getUpdate();
-      IJobUpdateKey key1 = update.getSummary().getKey();
       Function<JobUpdateStatus, JobUpdateStatus> stateChange =
-          isCoordinatedAndPulseExpired(key1, update.getInstructions())
+          isCoordinatedAndPulseExpired(key, update.getInstructions())
               ? GET_BLOCKED_RESUME_STATE
               : GET_ACTIVE_RESUME_STATE;
 
@@ -302,16 +312,13 @@ class JobUpdateControllerImpl implements JobUpdateController {
   private static final Ordering<IJobUpdateEvent> CHRON_ORDERING =
       Ordering.from(Comparator.comparingLong(IJobUpdateEvent::getTimestampMs));
 
-  private long inferLastPulseTimestamp(IJobUpdateDetails details) {
+  private long inferLastPulseTimestamp(IJobUpdateEvent mostRecent) {
     // Pulse timestamps are not durably stored by design. However, on system recovery,
     // setting the timestamp of the last pulse to 0L (aka no pulse) is not correct.
     // By inspecting the job update events we can infer a reasonable time stamp to initialize to.
     // In this case, if the upgrade was not waiting for a pulse previously, we can reuse the
     // timestamp of the last event. This does reset the counter for pulses, but reflects the
     // most likely behaviour of a healthy system.
-
-    // This is safe because we always write at least one job update event on job update creation
-    IJobUpdateEvent mostRecent = CHRON_ORDERING.max(details.getUpdateEvents());
 
     long ts = 0L;
 
@@ -320,6 +327,18 @@ class JobUpdateControllerImpl implements JobUpdateController {
     }
 
     return ts;
+  }
+
+  public boolean isAutoPauseEnabled(IJobUpdateStrategy strategy) {
+    if (strategy.isSetBatchStrategy()) {
+      return strategy.getBatchStrategy().isAutopauseAfterBatch();
+    }
+
+    if (strategy.isSetVarBatchStrategy()) {
+      return strategy.getVarBatchStrategy().isAutopauseAfterBatch();
+    }
+
+    return false;
   }
 
   @Override
@@ -332,12 +351,34 @@ class JobUpdateControllerImpl implements JobUpdateController {
         IJobUpdateInstructions instructions = details.getUpdate().getInstructions();
         IJobUpdateKey key = summary.getKey();
         JobUpdateStatus status = summary.getState().getStatus();
+        // This is safe because we always write at least one job update event on job update creation
+        IJobUpdateEvent latestEvent = CHRON_ORDERING.max(details.getUpdateEvents());
 
         if (isCoordinatedUpdate(instructions)) {
           LOG.info("Automatically restoring pulse state for " + key);
 
-          long pulseMs = inferLastPulseTimestamp(details);
+          long pulseMs = inferLastPulseTimestamp(latestEvent);
           pulseHandler.initializePulseState(details.getUpdate(), status, pulseMs);
+        }
+        // Since the restart causes the update to lose state, we backfill instances seen if:
+        // a) The update has auto pause after batch enabled
+        // b) The update is not currently paused.
+        // This restores necessary state for any update that was ROLLING_FORWARD when
+        // the scheduler was restarted to avoid crashing the scheduler.
+        // We do not backfill when the update is in the ROLL_FORWARD_PAUSED status as the subsequent
+        // resume will correctly re-initialize the seen instances state for the update.
+        if (isAutoPauseEnabled(instructions.getSettings().getUpdateStrategy())
+            && latestEvent.getStatus() == ROLLING_FORWARD) {
+          LOG.info("Re-populating previously seen instances for " + key);
+
+          instancesSeen.put(key,
+              storeProvider.getJobUpdateStore()
+                  .fetchJobUpdate(key)
+                  .get()
+                  .getInstanceEvents()
+                  .stream()
+                  .map(e -> e.getInstanceId())
+                  .collect(Collectors.toCollection(HashSet::new)));
         }
 
         if (AUTO_RESUME_STATES.contains(status)) {
@@ -403,20 +444,28 @@ class JobUpdateControllerImpl implements JobUpdateController {
   }
 
   private void instanceChanged(final IInstanceKey instance, final Optional<IScheduledTask> state) {
-    batchWorker.execute(storeProvider -> {
+    taskEventBatchWorker.execute(storeProvider -> {
       IJobKey job = instance.getJobKey();
       UpdateFactory.Update update = updates.get(job);
       if (update != null) {
         if (update.getUpdater().containsInstance(instance.getInstanceId())) {
-          LOG.info("Forwarding task change for " + InstanceKeys.toString(instance));
-          try {
-            evaluateUpdater(
-                storeProvider,
-                update,
-                getOnlyMatch(storeProvider.getJobUpdateStore(), queryActiveByJob(job)),
-                ImmutableMap.of(instance.getInstanceId(), state));
-          } catch (UpdateStateException e) {
-            throw new RuntimeException(e);
+          // We check to see if the state change is specified, and if it is, ensure that the new
+          // state matches the current state. We do this because events are processed asynchronously
+          // and it is possible for an old event trigger an action that should not be triggered
+          // for the actual updated state.
+          if (!state.isPresent() || isLatestState(storeProvider, state.get())) {
+            LOG.info("Forwarding task change for " + InstanceKeys.toString(instance));
+            try {
+              evaluateUpdater(
+                  storeProvider,
+                  update,
+                  getOnlyMatch(storeProvider.getJobUpdateStore(), queryActiveByJob(job)),
+                  ImmutableMap.of(instance.getInstanceId(), state));
+            } catch (UpdateStateException e) {
+              throw new RuntimeException(e);
+            }
+          } else {
+            LOG.info("Ignoring out of date task change for " + instance);
           }
         } else {
           LOG.info("Instance " + instance + " is not part of active update for "
@@ -425,6 +474,20 @@ class JobUpdateControllerImpl implements JobUpdateController {
       }
       return BatchWorker.NO_RESULT;
     });
+  }
+
+  /**
+   * Check to see that a given {@link IScheduledTask} still exists in storage and has the same
+   * status.
+   */
+  private boolean isLatestState(MutableStoreProvider storeProvider, IScheduledTask reportedState) {
+    Optional<IScheduledTask> currentState = storeProvider
+        .getTaskStore()
+        .fetchTask(reportedState.getAssignedTask().getTaskId());
+
+    return currentState
+        .map(iScheduledTask -> iScheduledTask.getStatus() == reportedState.getStatus())
+        .orElse(false);
   }
 
   private IJobUpdateSummary getOnlyMatch(JobUpdateStore store, IJobUpdateQuery query) {
@@ -573,10 +636,18 @@ class JobUpdateControllerImpl implements JobUpdateController {
   }
 
   @VisibleForTesting
-  static final String LOST_LOCK_MESSAGE = "Updater has lost its exclusive lock, unable to proceed.";
-
-  @VisibleForTesting
   static final String PULSE_TIMEOUT_MESSAGE = "Pulses from external service have timed out.";
+
+  // Determines whether it is necessary to skip evaluating a side effect if we will be pausing
+  // the update after this evaluation
+  private boolean skipSideEffect(
+      boolean pauseAfterBatch,
+      SideEffect sideEffect) {
+    return pauseAfterBatch
+        && Collections.disjoint(
+        sideEffect.getStatusChanges(),
+        InstanceUpdateStatus.TERMINAL_STATUSES);
+  }
 
   private void evaluateUpdater(
       final MutableStoreProvider storeProvider,
@@ -606,9 +677,24 @@ class JobUpdateControllerImpl implements JobUpdateController {
 
     EvaluationResult<Integer> result = update.getUpdater().evaluate(changedInstance, stateProvider);
 
-    LOG.info(key + " evaluation result: " + result);
+    LOG.info("{} evaluation result: {}", key, result);
+    final boolean autoPauseAfterCurrentBatch =
+        isAutoPauseEnabled(instructions.getSettings().getUpdateStrategy())
+        && maybeAutoPause(summary, result);
+    if (autoPauseAfterCurrentBatch) {
+      changeUpdateStatus(storeProvider,
+          summary,
+          newEvent(getPausedState(summary.getState().getStatus())).setMessage(UPDATE_AUTO_PAUSED));
+    }
 
     for (Map.Entry<Integer, SideEffect> entry : result.getSideEffects().entrySet()) {
+      // If we're pausing after processing this set of side effects, only process the side effects
+      // which are in a terminal state in order to avoid starting new shards after the pause
+      // has kicked in.
+      if (skipSideEffect(autoPauseAfterCurrentBatch, entry.getValue())) {
+        continue;
+      }
+
       Iterable<InstanceUpdateStatus> statusChanges;
 
       int instanceId = entry.getKey();
@@ -619,7 +705,7 @@ class JobUpdateControllerImpl implements JobUpdateController {
           .collect(Collectors.toList());
 
       Set<JobUpdateAction> savedActions =
-          FluentIterable.from(savedEvents).transform(EVENT_TO_ACTION).toSet();
+          savedEvents.stream().map(EVENT_TO_ACTION).collect(Collectors.toSet());
 
       // Don't bother persisting a sequence of status changes that represents an instance that
       // was immediately recognized as being healthy and in the desired state.
@@ -676,30 +762,35 @@ class JobUpdateControllerImpl implements JobUpdateController {
           }
         }
       }
-      changeUpdateStatus(storeProvider, summary, event);
-    } else {
-      LOG.info("Executing side-effects for update of " + key + ": " + result.getSideEffects());
-      for (Map.Entry<Integer, SideEffect> entry : result.getSideEffects().entrySet()) {
-        IInstanceKey instance = InstanceKeys.from(key.getJob(), entry.getKey());
 
-        Optional<InstanceAction> action = entry.getValue().getAction();
-        if (action.isPresent()) {
-          Optional<InstanceActionHandler> handler = action.get().getHandler();
-          if (handler.isPresent()) {
-            Optional<Amount<Long, Time>> reevaluateDelay = handler.get().getReevaluationDelay(
-                instance,
-                instructions,
-                storeProvider,
-                stateManager,
-                updateAgentReserver,
-                updaterStatus,
-                key);
-            if (reevaluateDelay.isPresent()) {
-              executor.schedule(
-                  getDeferredEvaluator(instance, key),
-                  reevaluateDelay.get().getValue(),
-                  reevaluateDelay.get().getUnit().getTimeUnit());
-            }
+      changeUpdateStatus(storeProvider, summary, event);
+      return;
+    }
+
+    LOG.info("Executing side-effects for update of {}: {}",
+        key,
+        result.getSideEffects().entrySet());
+    for (Map.Entry<Integer, SideEffect> entry : result.getSideEffects().entrySet()) {
+      IInstanceKey instance = InstanceKeys.from(key.getJob(), entry.getKey());
+
+      Optional<InstanceAction> action = entry.getValue().getAction();
+      if (action.isPresent() && !skipSideEffect(autoPauseAfterCurrentBatch, entry.getValue())) {
+        Optional<InstanceActionHandler> handler = action.get().getHandler();
+        if (handler.isPresent()) {
+          Optional<Amount<Long, Time>> reevaluateDelay = handler.get().getReevaluationDelay(
+              instance,
+              instructions,
+              storeProvider,
+              stateManager,
+              updateAgentReserver,
+              updaterStatus,
+              key,
+              slaKillController);
+          if (reevaluateDelay.isPresent()) {
+            executor.schedule(
+                getDeferredEvaluator(instance, key),
+                reevaluateDelay.get().getValue(),
+                reevaluateDelay.get().getUnit().getTimeUnit());
           }
         }
       }
@@ -778,6 +869,37 @@ class JobUpdateControllerImpl implements JobUpdateController {
             }
           }
         }));
+  }
+
+  @VisibleForTesting
+  private boolean maybeAutoPause(IJobUpdateSummary summary, EvaluationResult<Integer> result) {
+    JobUpdateStatus updaterStatus = summary.getState().getStatus();
+    final IJobUpdateKey key = summary.getKey();
+
+    // Only apply auto-pause to an update rolling forward.
+    if (updaterStatus != ROLLING_FORWARD) {
+      return false;
+    }
+
+    if (instancesSeen.containsKey(key)) {
+      Set<Integer> instancesCached = instancesSeen.get(key);
+      Set<Integer> instancesBeingUpdated = result.getSideEffects().keySet();
+
+      if (result.getStatus() == SUCCEEDED) {
+        instancesSeen.remove(key);
+        return false;
+      }
+
+      // If the update evaluation is dealing with new instances, that signals we are at a barrier
+      // crossing.
+      if (!instancesCached.containsAll(instancesBeingUpdated)) {
+        instancesCached.addAll(instancesBeingUpdated);
+        return true;
+      }
+    } else {
+      instancesSeen.put(key, new HashSet<Integer>(result.getSideEffects().keySet()));
+    }
+    return false;
   }
 
   private static class PulseHandler {

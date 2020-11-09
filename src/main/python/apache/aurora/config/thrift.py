@@ -18,23 +18,32 @@ import re
 from pystachio import Empty, Ref
 from twitter.common.lang import Compatibility
 
-from apache.aurora.config.schema.base import AppcImage as PystachioAppcImage
-from apache.aurora.config.schema.base import Container as PystachioContainer
-from apache.aurora.config.schema.base import DockerImage as PystachioDockerImage
 from apache.aurora.config.schema.base import (
+    AppcImage as PystachioAppcImage,
+    BatchUpdateStrategy as PystachioBatchUpdateStrategy,
+    Container as PystachioContainer,
+    CoordinatorSlaPolicy as PystachioCoordinatorSlaPolicy,
+    CountSlaPolicy as PystachioCountSlaPolicy,
     Docker,
+    DockerImage as PystachioDockerImage,
     HealthCheckConfig,
     Mesos,
     MesosContext,
-    MesosTaskInstance
+    MesosTaskInstance,
+    PercentageSlaPolicy as PystachioPercentageSlaPolicy,
+    QueueUpdateStrategy as PystachioQueueUpdateStrategy,
+    VariableBatchUpdateStrategy as PystachioVariableBatchUpdateStrategy
 )
 from apache.thermos.config.loader import ThermosTaskValidator
 
 from gen.apache.aurora.api.constants import AURORA_EXECUTOR_NAME, GOOD_IDENTIFIER_PATTERN_PYTHON
 from gen.apache.aurora.api.ttypes import (
     AppcImage,
+    BatchJobUpdateStrategy,
     Constraint,
     Container,
+    CoordinatorSlaPolicy,
+    CountSlaPolicy,
     CronCollisionPolicy,
     DockerContainer,
     DockerImage,
@@ -44,15 +53,20 @@ from gen.apache.aurora.api.ttypes import (
     Image,
     JobConfiguration,
     JobKey,
+    JobUpdateStrategy,
     LimitConstraint,
     MesosContainer,
     Metadata,
     Mode,
     PartitionPolicy,
+    PercentageSlaPolicy,
+    QueueJobUpdateStrategy,
     Resource,
+    SlaPolicy,
     TaskConfig,
     TaskConstraint,
     ValueConstraint,
+    VariableBatchJobUpdateStrategy,
     Volume
 )
 
@@ -174,6 +188,41 @@ def create_container_config(container):
   raise InvalidConfig('If a container is specified it must set one type.')
 
 
+def create_update_strategy_config(update_strategy):
+  unwrapped = update_strategy.unwrap()
+  if unwrapped is Empty:
+    return JobUpdateStrategy(
+        queueStrategy=QueueJobUpdateStrategy(
+            groupSize=1),
+        batchStrategy=None,
+        varBatchStrategy=None)
+
+  if isinstance(unwrapped, PystachioQueueUpdateStrategy):
+    return JobUpdateStrategy(
+        queueStrategy=QueueJobUpdateStrategy(
+            groupSize=fully_interpolated(unwrapped.batch_size())),
+        batchStrategy=None,
+        varBatchStrategy=None)
+
+  if isinstance(unwrapped, PystachioBatchUpdateStrategy):
+    return JobUpdateStrategy(
+        queueStrategy=None,
+        batchStrategy=BatchJobUpdateStrategy(
+            groupSize=fully_interpolated(unwrapped.batch_size()),
+            autopauseAfterBatch=fully_interpolated(
+              unwrapped.autopause_after_batch())),
+        varBatchStrategy=None)
+
+  if isinstance(unwrapped, PystachioVariableBatchUpdateStrategy):
+    return JobUpdateStrategy(
+        queueStrategy=None,
+        batchStrategy=None,
+        varBatchStrategy=VariableBatchJobUpdateStrategy(
+            groupSizes=fully_interpolated(unwrapped.batch_sizes()),
+            autopauseAfterBatch=fully_interpolated(
+                unwrapped.autopause_after_batch())))
+
+
 def volumes_to_thrift(volumes):
   thrift_volumes = []
   for v in volumes:
@@ -244,6 +293,37 @@ THERMOS_PORT_SCOPE_REF = Ref.from_address('thermos.ports')
 THERMOS_TASK_ID_REF = Ref.from_address('thermos.task_id')
 
 
+def create_sla_policy(sla_policy):
+  unwrapped = sla_policy.unwrap()
+  if isinstance(unwrapped, PystachioPercentageSlaPolicy):
+    return SlaPolicy(
+      percentageSlaPolicy=PercentageSlaPolicy(
+        fully_interpolated(unwrapped.percentage()),
+        fully_interpolated(unwrapped.duration_secs()),
+      ),
+      countSlaPolicy=None,
+      coordinatorSlaPolicy=None
+    )
+  elif isinstance(unwrapped, PystachioCountSlaPolicy):
+    return SlaPolicy(
+      percentageSlaPolicy=None,
+      countSlaPolicy=CountSlaPolicy(
+        fully_interpolated(unwrapped.count()),
+        fully_interpolated(unwrapped.duration_secs()),
+      ),
+      coordinatorSlaPolicy=None
+    )
+  elif isinstance(unwrapped, PystachioCoordinatorSlaPolicy):
+    return SlaPolicy(
+      percentageSlaPolicy=None,
+      countSlaPolicy=None,
+      coordinatorSlaPolicy=CoordinatorSlaPolicy(
+        fully_interpolated(unwrapped.coordinator_url()),
+        fully_interpolated(unwrapped.status_key()),
+      )
+    )
+
+
 def convert(job, metadata=frozenset(), ports=frozenset()):
   """Convert a Pystachio MesosJob to an Aurora Thrift JobConfiguration."""
 
@@ -273,6 +353,9 @@ def convert(job, metadata=frozenset(), ports=frozenset()):
     task.partitionPolicy = PartitionPolicy(
       fully_interpolated(job.partition_policy().reschedule()),
       fully_interpolated(job.partition_policy().delay_secs()))
+
+  if job.has_sla_policy():
+    task.slaPolicy = create_sla_policy(job.sla_policy())
 
   # Add metadata to a task, to display in the scheduler UI.
   metadata_set = frozenset()
@@ -337,9 +420,16 @@ def convert(job, metadata=frozenset(), ports=frozenset()):
   if unbound:
     raise InvalidConfig('Config contains unbound variables: %s' % ' '.join(map(str, unbound)))
 
-  task.executorConfig = ExecutorConfig(
+  # set the executor that will be used by the Mesos task. Thermos is the default
+  executor = job.executor_config()
+  if fully_interpolated(executor.name()) == AURORA_EXECUTOR_NAME:
+    task.executorConfig = ExecutorConfig(
       name=AURORA_EXECUTOR_NAME,
       data=filter_aliased_fields(underlying).json_dumps())
+  else:
+    task.executorConfig = ExecutorConfig(
+      name=fully_interpolated(executor.name()),
+      data=fully_interpolated(executor.data()))
 
   return JobConfiguration(
       key=key,

@@ -24,6 +24,8 @@ from apache.thermos.config.schema_base import MB, Process, Resources, Task
 
 from .util import AuroraClientCommandTest
 
+from gen.apache.aurora.api.constants import AURORA_EXECUTOR_NAME
+
 
 class TestInspectCommand(AuroraClientCommandTest):
   def get_job_config(self):
@@ -110,7 +112,8 @@ Process 'process':
             "watch_secs": 45,
             "rollback_on_failure": True,
             "max_per_shard_failures": 0,
-            "max_total_failures": 0},
+            "max_total_failures": 0,
+            "sla_aware": False},
         "name": "the_job",
         "max_task_failures": 1,
         "cron_collision_policy": "KILL_EXISTING",
@@ -138,6 +141,10 @@ Process 'process':
         "production": False,
         "role": "bozo",
         "contact": "bozo@the.clown",
+        "executor_config": {
+         "name": AURORA_EXECUTOR_NAME,
+         "data": ""
+        },
         "metadata": [],
         "lifecycle": {
             "http": {

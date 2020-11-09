@@ -169,6 +169,9 @@ public class CommandLineTest {
     expected.zk.digestCredentials = "testing";
     expected.updater.enableAffinity = true;
     expected.updater.affinityExpiration = TEST_TIME;
+    expected.updater.slaAwareActionMaxBatchSize = 42;
+    expected.updater.slaAwareKillRetryMinDelay = new TimeAmount(42, Time.DAYS);
+    expected.updater.slaAwareKillRetryMaxDelay = new TimeAmount(42, Time.DAYS);
     expected.state.taskAssignerModules = ImmutableList.of(NoopModule.class);
     expected.snapshot.snapshotInterval = TEST_TIME;
     expected.logPersistence.maxLogEntrySize = TEST_DATA;
@@ -220,6 +223,7 @@ public class CommandLineTest {
     expected.preemptor.enablePreemptor = false;
     expected.preemptor.preemptionDelay = TEST_TIME;
     expected.preemptor.preemptionSlotHoldTime = TEST_TIME;
+    expected.preemptor.preemptionSlotSearchInitialDelay = TEST_TIME;
     expected.preemptor.preemptionSlotSearchInterval = TEST_TIME;
     expected.preemptor.reservationMaxBatchSize = 42;
     expected.preemptor.slotFinderModules = ImmutableList.of(NoopModule.class);
@@ -230,9 +234,14 @@ public class CommandLineTest {
     expected.mesosLog.coordinatorElectionRetries = 42;
     expected.mesosLog.readTimeout = TEST_TIME;
     expected.mesosLog.writeTimeout = TEST_TIME;
-    expected.sla.slaRefreshInterval = TEST_TIME;
+    expected.sla.minRequiredInstances = 42;
+    expected.sla.maxParallelCoordinators = 42;
+    expected.sla.maxSlaDuration = TEST_TIME;
+    expected.sla.slaCoordinatorTimeout = TEST_TIME;
     expected.sla.slaProdMetrics = ImmutableList.of(MetricCategory.JOB_UPTIMES);
     expected.sla.slaNonProdMetrics = ImmutableList.of(MetricCategory.JOB_UPTIMES);
+    expected.sla.slaRefreshInterval = TEST_TIME;
+    expected.sla.slaAwareKillNonProd = true;
     expected.webhook.webhookConfigFile = tempFile;
     expected.scheduler.maxRegistrationDelay = TEST_TIME;
     expected.scheduler.maxLeadingDuration = TEST_TIME;
@@ -250,6 +259,7 @@ public class CommandLineTest {
     expected.cron.cronMaxBatchSize = 42;
     expected.resourceSettings.enableRevocableCpus = false;
     expected.resourceSettings.enableRevocableRam = true;
+    expected.maintenance.hostMaintenancePollingInterval = TEST_TIME;
 
     assertAllNonDefaultParameters(expected);
 
@@ -314,6 +324,10 @@ public class CommandLineTest {
         "-zk_digest_credentials=testing",
         "-enable_update_affinity=true",
         "-update_affinity_reservation_hold_time=42days",
+        "-sla_aware_action_max_batch_size=42",
+        "-sla_aware_kill_retry_min_delay=42days",
+        "-sla_aware_kill_retry_max_delay=42days",
+        "-sla_aware_kill_non_prod=true",
         "-task_assigner_modules=org.apache.aurora.scheduler.config.CommandLineTest$NoopModule",
         "-dlog_snapshot_interval=42days",
         "-dlog_max_entry_size=42GB",
@@ -352,6 +366,7 @@ public class CommandLineTest {
         "-enable_preemptor=false",
         "-preemption_delay=42days",
         "-preemption_slot_hold_time=42days",
+        "-preemption_slot_search_initial_delay=42days",
         "-preemption_slot_search_interval=42days",
         "-preemption_reservation_max_batch_size=42",
         "-preemption_slot_finder_modules="
@@ -383,7 +398,12 @@ public class CommandLineTest {
         "-cron_scheduling_max_batch_size=42",
         "-enable_revocable_cpus=false",
         "-enable_revocable_ram=true",
-        "-partition_aware=true"
+        "-partition_aware=true",
+        "-sla_coordinator_timeout=42days",
+        "-host_maintenance_polling_interval=42days",
+        "-max_parallel_coordinated_maintenance=42",
+        "-min_required_instances_for_sla_check=42",
+        "-max_sla_duration_secs=42days"
     );
     assertEqualOptions(expected, parsed);
   }

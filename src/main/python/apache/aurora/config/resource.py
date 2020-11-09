@@ -12,9 +12,8 @@
 # limitations under the License.
 #
 from collections import namedtuple
-from numbers import Number
-
 from enum import Enum, unique
+from numbers import Number
 
 from gen.apache.aurora.api.ttypes import Resource
 
@@ -85,7 +84,7 @@ class ResourceManager(object):
 
   @classmethod
   def resource_details_from_quota(cls, quota):
-    return cls.resource_details(cls._backfill_resources(quota))
+    return cls.resource_details(quota.resources)
 
   @classmethod
   def resource_details_from_task(cls, task):

@@ -13,10 +13,12 @@
  */
 package org.apache.aurora.scheduler.updater;
 
+import java.util.Collection;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.stream.Collectors;
 
 import com.google.common.base.Function;
 import com.google.common.collect.ImmutableList;
@@ -43,6 +45,8 @@ import org.apache.aurora.common.stats.StatsProvider;
 import org.apache.aurora.common.testing.easymock.EasyMockTest;
 import org.apache.aurora.common.util.Clock;
 import org.apache.aurora.common.util.TruncatedBinaryBackoff;
+import org.apache.aurora.gen.BatchJobUpdateStrategy;
+import org.apache.aurora.gen.CountSlaPolicy;
 import org.apache.aurora.gen.InstanceTaskConfig;
 import org.apache.aurora.gen.JobUpdate;
 import org.apache.aurora.gen.JobUpdateAction;
@@ -53,15 +57,21 @@ import org.apache.aurora.gen.JobUpdatePulseStatus;
 import org.apache.aurora.gen.JobUpdateSettings;
 import org.apache.aurora.gen.JobUpdateState;
 import org.apache.aurora.gen.JobUpdateStatus;
+import org.apache.aurora.gen.JobUpdateStrategy;
 import org.apache.aurora.gen.JobUpdateSummary;
 import org.apache.aurora.gen.Metadata;
+import org.apache.aurora.gen.QueueJobUpdateStrategy;
 import org.apache.aurora.gen.Range;
 import org.apache.aurora.gen.ScheduleStatus;
 import org.apache.aurora.gen.ScheduledTask;
+import org.apache.aurora.gen.ServerInfo;
+import org.apache.aurora.gen.SlaPolicy;
 import org.apache.aurora.gen.TaskConfig;
+import org.apache.aurora.gen.VariableBatchJobUpdateStrategy;
 import org.apache.aurora.scheduler.SchedulerModule.TaskEventBatchWorker;
 import org.apache.aurora.scheduler.TaskIdGenerator;
 import org.apache.aurora.scheduler.TaskIdGenerator.TaskIdGeneratorImpl;
+import org.apache.aurora.scheduler.TierModule;
 import org.apache.aurora.scheduler.base.JobKeys;
 import org.apache.aurora.scheduler.base.Query;
 import org.apache.aurora.scheduler.base.TaskTestUtil;
@@ -72,6 +82,7 @@ import org.apache.aurora.scheduler.events.PubsubEvent;
 import org.apache.aurora.scheduler.mesos.Driver;
 import org.apache.aurora.scheduler.scheduling.RescheduleCalculator;
 import org.apache.aurora.scheduler.scheduling.RescheduleCalculator.RescheduleCalculatorImpl;
+import org.apache.aurora.scheduler.sla.SlaModule;
 import org.apache.aurora.scheduler.state.StateChangeResult;
 import org.apache.aurora.scheduler.state.StateManager;
 import org.apache.aurora.scheduler.state.StateManagerImpl;
@@ -88,12 +99,14 @@ import org.apache.aurora.scheduler.storage.entities.IJobUpdateEvent;
 import org.apache.aurora.scheduler.storage.entities.IJobUpdateKey;
 import org.apache.aurora.scheduler.storage.entities.IJobUpdateSummary;
 import org.apache.aurora.scheduler.storage.entities.IScheduledTask;
+import org.apache.aurora.scheduler.storage.entities.IServerInfo;
 import org.apache.aurora.scheduler.storage.entities.ITaskConfig;
 import org.apache.aurora.scheduler.storage.mem.MemStorageModule;
 import org.apache.aurora.scheduler.testing.FakeScheduledExecutor;
 import org.apache.aurora.scheduler.testing.FakeStatsProvider;
 import org.apache.aurora.scheduler.updater.JobUpdateController.AuditData;
 import org.apache.aurora.scheduler.updater.StateEvaluator.Failure;
+import org.apache.aurora.scheduler.updater.UpdaterModule.UpdateActionBatchWorker;
 import org.easymock.EasyMock;
 import org.easymock.IExpectationSetters;
 import org.junit.After;
@@ -119,6 +132,7 @@ import static org.apache.aurora.gen.ScheduleStatus.ASSIGNED;
 import static org.apache.aurora.gen.ScheduleStatus.FAILED;
 import static org.apache.aurora.gen.ScheduleStatus.FINISHED;
 import static org.apache.aurora.gen.ScheduleStatus.KILLED;
+import static org.apache.aurora.gen.ScheduleStatus.KILLING;
 import static org.apache.aurora.gen.ScheduleStatus.RUNNING;
 import static org.apache.aurora.gen.ScheduleStatus.STARTING;
 import static org.apache.aurora.scheduler.storage.Storage.MutateWork.NoResult;
@@ -126,6 +140,7 @@ import static org.apache.aurora.scheduler.testing.BatchWorkerUtil.expectBatchExe
 import static org.apache.aurora.scheduler.updater.UpdateFactory.UpdateFactoryImpl.expandInstanceIds;
 import static org.easymock.EasyMock.expectLastCall;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public class JobUpdaterIT extends EasyMockTest {
@@ -143,6 +158,8 @@ public class JobUpdaterIT extends EasyMockTest {
   private static final ITaskConfig OLD_CONFIG =
       setExecutorData(TaskTestUtil.makeConfig(JOB), "olddata");
   private static final ITaskConfig NEW_CONFIG = setExecutorData(OLD_CONFIG, "newdata");
+  private static final ITaskConfig SLA_AWARE_CONFIG =
+      setCountSlaPolicy(setExecutorData(OLD_CONFIG, "sladata"), 2, 0);
   private static final long PULSE_TIMEOUT_MS = 10000;
   private static final ImmutableSet<Metadata> METADATA = ImmutableSet.of(
       new Metadata("k1", "v1"), new Metadata("k2", "v2"));
@@ -162,6 +179,13 @@ public class JobUpdaterIT extends EasyMockTest {
     return ITaskConfig.build(builder);
   }
 
+  private static ITaskConfig setCountSlaPolicy(ITaskConfig task, int count, int durationMs) {
+    TaskConfig builder = task.newBuilder();
+    SlaPolicy policy = SlaPolicy.countSlaPolicy(new CountSlaPolicy(count, durationMs));
+    builder.setSlaPolicy(policy);
+    return ITaskConfig.build(builder);
+  }
+
   @Before
   public void setUp() throws Exception {
     // Avoid console spam due to stats registered multiple times.
@@ -171,13 +195,24 @@ public class JobUpdaterIT extends EasyMockTest {
     driver = createMock(Driver.class);
     shutdownCommand = createMock(Command.class);
     eventBus = new EventBus();
-    TaskEventBatchWorker batchWorker = createMock(TaskEventBatchWorker.class);
+    TaskEventBatchWorker taskEventBatchWorker = createMock(TaskEventBatchWorker.class);
+    UpdateActionBatchWorker updateActionBatchWorker = createMock(UpdateActionBatchWorker.class);
 
-    UpdaterModule.Options options = new UpdaterModule.Options();
-    options.enableAffinity = true;
+    UpdaterModule.Options updaterOptions = new UpdaterModule.Options();
+    updaterOptions.enableAffinity = true;
+    updaterOptions.slaAwareKillRetryMinDelay = new TimeAmount(
+        WATCH_TIMEOUT.getValue(),
+        WATCH_TIMEOUT.getUnit());
+    updaterOptions.slaAwareKillRetryMaxDelay = new TimeAmount(
+        WATCH_TIMEOUT.getValue(),
+        WATCH_TIMEOUT.getUnit());
+    SlaModule.Options slaOptions = new SlaModule.Options();
+    slaOptions.minRequiredInstances = 3;
 
     Injector injector = Guice.createInjector(
-        new UpdaterModule(executor, options),
+        new UpdaterModule(executor, Optional.of(updateActionBatchWorker), updaterOptions),
+        new SlaModule(slaOptions),
+        new TierModule(TaskTestUtil.TIER_CONFIG),
         new MemStorageModule(),
         new AbstractModule() {
           @Override
@@ -197,7 +232,13 @@ public class JobUpdaterIT extends EasyMockTest {
             bind(EventSink.class).toInstance(eventBus::post);
             bind(UUIDGenerator.class).to(UUIDGeneratorImpl.class);
             bind(Lifecycle.class).toInstance(new Lifecycle(shutdownCommand));
-            bind(TaskEventBatchWorker.class).toInstance(batchWorker);
+            bind(TaskEventBatchWorker.class).toInstance(taskEventBatchWorker);
+            bind(UpdateActionBatchWorker.class).toInstance(updateActionBatchWorker);
+            bind(IServerInfo.class).toInstance(
+                IServerInfo.build(
+                    new ServerInfo()
+                        .setClusterName("JobUpdaterITCluster")
+                        .setStatsUrlPrefix("test_stats_prefix")));
           }
         });
     updater = injector.getInstance(JobUpdateController.class);
@@ -206,7 +247,8 @@ public class JobUpdaterIT extends EasyMockTest {
     stateManager = injector.getInstance(StateManager.class);
     eventBus.register(injector.getInstance(JobUpdateEventSubscriber.class));
     subscriber = injector.getInstance(JobUpdateEventSubscriber.class);
-    expectBatchExecute(batchWorker, storage, control).anyTimes();
+    expectBatchExecute(taskEventBatchWorker, storage, control).anyTimes();
+    expectBatchExecute(updateActionBatchWorker, storage, control).anyTimes();
   }
 
   @After
@@ -768,8 +810,8 @@ public class JobUpdaterIT extends EasyMockTest {
 
     JobUpdate builder = makeJobUpdate(makeInstanceConfig(0, 2, OLD_CONFIG)).newBuilder();
     builder.getInstructions().getSettings()
-        .setWaitForBatchCompletion(true)
-        .setUpdateGroupSize(2);
+        .setUpdateStrategy(
+            JobUpdateStrategy.batchStrategy(new BatchJobUpdateStrategy().setGroupSize(2)));
     IJobUpdate update = IJobUpdate.build(builder);
     insertInitialTasks(update);
 
@@ -1067,7 +1109,10 @@ public class JobUpdaterIT extends EasyMockTest {
     control.replay();
 
     JobUpdate update = makeJobUpdate().newBuilder();
-    update.getInstructions().getSettings().setUpdateGroupSize(-1);
+    update.getInstructions()
+        .getSettings()
+        .setUpdateStrategy(
+            JobUpdateStrategy.queueStrategy(new QueueJobUpdateStrategy().setGroupSize(-1)));
     expectInvalid(update);
 
     update = makeJobUpdate().newBuilder();
@@ -1083,7 +1128,8 @@ public class JobUpdaterIT extends EasyMockTest {
 
     control.replay();
 
-    IJobUpdate update = setInstanceCount(makeJobUpdate(makeInstanceConfig(0, 1, OLD_CONFIG)), 2);
+    IJobUpdate update = setInstanceCount(
+        makeJobUpdate(makeInstanceConfig(0, 1, OLD_CONFIG)), 2);
     insertInitialTasks(update);
 
     changeState(JOB, 0, ASSIGNED, STARTING, RUNNING);
@@ -1102,7 +1148,11 @@ public class JobUpdaterIT extends EasyMockTest {
       store.deleteAllUpdates();
 
       JobUpdate builder = update.newBuilder();
-      builder.getInstructions().getSettings().setUpdateGroupSize(0);
+      builder.getInstructions()
+          .getSettings()
+          .getUpdateStrategy()
+          .getQueueStrategy()
+          .setGroupSize(0);
       saveJobUpdate(store, IJobUpdate.build(builder), ROLLING_FORWARD);
     });
 
@@ -1313,8 +1363,8 @@ public class JobUpdaterIT extends EasyMockTest {
 
     JobUpdate builder = makeJobUpdate(makeInstanceConfig(0, 2, OLD_CONFIG)).newBuilder();
     builder.getInstructions().getSettings()
-        .setWaitForBatchCompletion(true)
-        .setUpdateGroupSize(2);
+        .setUpdateStrategy(
+            JobUpdateStrategy.batchStrategy(new BatchJobUpdateStrategy().setGroupSize(2)));
     IJobUpdate update = IJobUpdate.build(builder);
     insertInitialTasks(update);
 
@@ -1367,8 +1417,8 @@ public class JobUpdaterIT extends EasyMockTest {
 
     JobUpdate builder = makeJobUpdate(makeInstanceConfig(0, 2, OLD_CONFIG)).newBuilder();
     builder.getInstructions().getSettings()
-        .setWaitForBatchCompletion(true)
-        .setUpdateGroupSize(2);
+        .setUpdateStrategy(
+            JobUpdateStrategy.batchStrategy(new BatchJobUpdateStrategy().setGroupSize(2)));
     IJobUpdate update = IJobUpdate.build(builder);
     insertInitialTasks(update);
 
@@ -1523,6 +1573,469 @@ public class JobUpdaterIT extends EasyMockTest {
     }
   }
 
+  @Test
+  public void testSuccessfulSlaAwareUpdate() throws Exception {
+    expectTaskKilled().times(3);
+
+    control.replay();
+
+    // Our batch size is 3 but our SLA policy only allows for 1 instance to be down at a time.
+    // We want to ensure that only one instance is killed at a time.
+    JobUpdate builder = makeJobUpdate(3, SLA_AWARE_CONFIG, makeInstanceConfig(0, 2, OLD_CONFIG))
+        .newBuilder();
+    builder.getInstructions().getSettings().setSlaAware(true);
+    IJobUpdate update = setInstanceCount(IJobUpdate.build(builder), 3);
+    insertInitialTasks(update);
+
+    changeState(JOB, 0, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 1, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 2, ASSIGNED, STARTING, RUNNING);
+
+    ImmutableMultimap.Builder<Integer, JobUpdateAction> actions = ImmutableMultimap.builder();
+
+    updater.start(update, AUDIT);
+    actions.put(0, INSTANCE_UPDATING);
+    actions.put(0, INSTANCE_UPDATING); // Awaiting SLA check to pass
+    actions.put(1, INSTANCE_UPDATING);
+    actions.put(1, INSTANCE_UPDATING); // Awaiting SLA check to pass
+    actions.put(2, INSTANCE_UPDATING);
+    actions.put(2, INSTANCE_UPDATING); // Awaiting SLA check to pass
+
+    // SLA aware update should only send one instance to KILLING -- find which one.
+    int firstTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(firstTaskBeingKilled, INSTANCE_UPDATING); // SLA check passed, killing
+    changeState(JOB, firstTaskBeingKilled, KILLED);
+
+    // Sanity check that after a kill delay but before the task is RUNNING again, we do not kill
+    // another task.
+    clock.advance(WATCH_TIMEOUT);
+    assertTrue(Iterables.isEmpty(getTasksInState(JOB, KILLING)));
+    assertState(ROLLING_FORWARD, actions.build());
+
+    // First task finishes updating
+    changeState(JOB, firstTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(firstTaskBeingKilled, INSTANCE_UPDATED);
+
+    // Update the second task
+    int secondTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(secondTaskBeingKilled, INSTANCE_UPDATING); // SLA check passed, killing
+    changeState(JOB, secondTaskBeingKilled, KILLED);
+    changeState(JOB, secondTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(secondTaskBeingKilled, INSTANCE_UPDATED);
+
+    // Update the final task
+    int finalTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(finalTaskBeingKilled, INSTANCE_UPDATING); // SLA check passed, killing
+    changeState(JOB, finalTaskBeingKilled, KILLED);
+    changeState(JOB, finalTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(finalTaskBeingKilled, INSTANCE_UPDATED);
+
+    assertState(ROLLED_FORWARD, actions.build());
+    assertJobState(
+        JOB,
+        ImmutableMap.of(0, SLA_AWARE_CONFIG, 1, SLA_AWARE_CONFIG, 2, SLA_AWARE_CONFIG));
+  }
+
+  @Test
+  public void testSuccessfulSlaAwareUpdateWithPause() throws Exception {
+    expectTaskKilled().times(3);
+
+    control.replay();
+
+    JobUpdate builder = makeJobUpdate(3, SLA_AWARE_CONFIG, makeInstanceConfig(0, 2, OLD_CONFIG))
+        .newBuilder();
+    builder.getInstructions().getSettings().setSlaAware(true);
+    IJobUpdate update = setInstanceCount(IJobUpdate.build(builder), 3);
+    insertInitialTasks(update);
+
+    changeState(JOB, 0, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 1, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 2, ASSIGNED, STARTING, RUNNING);
+
+    ImmutableMultimap.Builder<Integer, JobUpdateAction> actions = ImmutableMultimap.builder();
+
+    updater.start(update, AUDIT);
+    actions.put(0, INSTANCE_UPDATING);
+    actions.put(0, INSTANCE_UPDATING);
+    actions.put(1, INSTANCE_UPDATING);
+    actions.put(1, INSTANCE_UPDATING);
+    actions.put(2, INSTANCE_UPDATING);
+    actions.put(2, INSTANCE_UPDATING);
+
+    int firstTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(firstTaskBeingKilled, INSTANCE_UPDATING);
+    changeState(JOB, firstTaskBeingKilled, KILLED);
+    changeState(JOB, firstTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+
+    // Pause the update to stop progress
+    assertState(ROLLING_FORWARD, actions.build());
+    updater.pause(UPDATE_ID, AUDIT);
+    assertState(ROLL_FORWARD_PAUSED, actions.build());
+
+    // Ensure no tasks are killed while paused
+    clock.advance(WATCH_TIMEOUT);
+    assertTrue(Iterables.isEmpty(getTasksInState(JOB, KILLING)));
+
+    // Unpause and continue as normal
+    updater.resume(UPDATE_ID, AUDIT);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(firstTaskBeingKilled, INSTANCE_UPDATED);
+
+    int secondTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(secondTaskBeingKilled, INSTANCE_UPDATING);
+    changeState(JOB, secondTaskBeingKilled, KILLED);
+    changeState(JOB, secondTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(secondTaskBeingKilled, INSTANCE_UPDATED);
+
+    int finalTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(finalTaskBeingKilled, INSTANCE_UPDATING);
+    changeState(JOB, finalTaskBeingKilled, KILLED);
+    changeState(JOB, finalTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(finalTaskBeingKilled, INSTANCE_UPDATED);
+
+    assertState(ROLLED_FORWARD, actions.build());
+    assertJobState(
+        JOB,
+        ImmutableMap.of(0, SLA_AWARE_CONFIG, 1, SLA_AWARE_CONFIG, 2, SLA_AWARE_CONFIG));
+  }
+
+  @Test
+  public void testSuccessfulSlaAwareUpdateWithRollback() throws Exception {
+    expectTaskKilled().times(4);
+    // We need both the old and new config to be SLA aware for this rollback
+    ITaskConfig slaAwareOldConfig = setCountSlaPolicy(setExecutorData(OLD_CONFIG, "old"), 2, 0);
+
+    control.replay();
+
+    JobUpdate builder = makeJobUpdate(
+        3,
+        SLA_AWARE_CONFIG,
+        makeInstanceConfig(0, 2, slaAwareOldConfig)).newBuilder();
+    builder.getInstructions().getSettings().setSlaAware(true);
+    IJobUpdate update = setInstanceCount(IJobUpdate.build(builder), 3);
+    insertInitialTasks(update);
+
+    changeState(JOB, 0, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 1, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 2, ASSIGNED, STARTING, RUNNING);
+
+    ImmutableMultimap.Builder<Integer, JobUpdateAction> actions = ImmutableMultimap.builder();
+
+    updater.start(update, AUDIT);
+    actions.put(0, INSTANCE_UPDATING);
+    actions.put(0, INSTANCE_UPDATING);
+    actions.put(1, INSTANCE_UPDATING);
+    actions.put(1, INSTANCE_UPDATING);
+    actions.put(2, INSTANCE_UPDATING);
+    actions.put(2, INSTANCE_UPDATING);
+
+    int firstTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(firstTaskBeingKilled, INSTANCE_UPDATING);
+    changeState(JOB, firstTaskBeingKilled, KILLED);
+    changeState(JOB, firstTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(firstTaskBeingKilled, INSTANCE_UPDATED);
+
+    int secondTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(secondTaskBeingKilled, INSTANCE_UPDATING);
+    changeState(JOB, secondTaskBeingKilled, KILLED);
+    changeState(JOB, secondTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+
+    int finalTaskNotKilled = Iterables.getOnlyElement(getTasksInState(JOB, RUNNING)
+        .stream()
+        .filter(t -> t.getAssignedTask().getTask().equals(slaAwareOldConfig))
+        .map(t -> t.getAssignedTask().getInstanceId())
+        .collect(Collectors.toList()));
+
+    // Roll the update back with 2/3 instances on the new config
+    assertJobState(
+        JOB,
+        ImmutableMap.of(
+            firstTaskBeingKilled, SLA_AWARE_CONFIG,
+            secondTaskBeingKilled, SLA_AWARE_CONFIG,
+            finalTaskNotKilled, slaAwareOldConfig));
+    updater.rollback(UPDATE_ID, AUDIT);
+    actions.put(firstTaskBeingKilled, INSTANCE_ROLLING_BACK);
+    actions.put(firstTaskBeingKilled, INSTANCE_ROLLING_BACK); // Awaiting SLA check to pass
+    actions.put(secondTaskBeingKilled, INSTANCE_ROLLING_BACK);
+    actions.put(secondTaskBeingKilled, INSTANCE_ROLLING_BACK); // Awaiting SLA check to pass
+    actions.put(finalTaskNotKilled, INSTANCE_ROLLING_BACK);
+    actions.put(finalTaskNotKilled, INSTANCE_ROLLED_BACK); // Task never updated originally
+
+    int firstRollbackTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(firstRollbackTaskBeingKilled, INSTANCE_ROLLING_BACK); // SLA check passed
+    changeState(JOB, firstRollbackTaskBeingKilled, KILLED);
+    changeState(JOB, firstRollbackTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(firstRollbackTaskBeingKilled, INSTANCE_ROLLED_BACK);
+
+    int secondRollbackTaskBeingKilled = Iterables
+        .getOnlyElement(getTasksInState(JOB, KILLING))
+        .getAssignedTask()
+        .getInstanceId();
+    actions.put(secondRollbackTaskBeingKilled, INSTANCE_ROLLING_BACK); // SLA check passed
+    changeState(JOB, secondRollbackTaskBeingKilled, KILLED);
+    changeState(JOB, secondRollbackTaskBeingKilled, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(secondRollbackTaskBeingKilled, INSTANCE_ROLLED_BACK);
+
+    assertState(ROLLED_BACK, actions.build());
+    assertJobState(
+        JOB,
+        ImmutableMap.of(0, slaAwareOldConfig, 1, slaAwareOldConfig, 2, slaAwareOldConfig));
+  }
+
+  @Test
+  public void testSuccessfulBatchUpdateAutoPause() throws Exception {
+    expectTaskKilled().times(3);
+
+    control.replay();
+
+    JobUpdate builder = makeJobUpdate(makeInstanceConfig(0, 2, OLD_CONFIG)).newBuilder();
+    builder.getInstructions().getSettings()
+        .setUpdateStrategy(
+            JobUpdateStrategy.batchStrategy(
+                new BatchJobUpdateStrategy().setGroupSize(2).setAutopauseAfterBatch(true)));
+    IJobUpdate update = IJobUpdate.build(builder);
+    insertInitialTasks(update);
+
+    changeState(JOB, 0, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 1, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 2, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+
+    ImmutableMultimap.Builder<Integer, JobUpdateAction> actions = ImmutableMultimap.builder();
+
+    // Instances 0 and 1 are updated.
+    updater.start(update, AUDIT);
+    actions.put(0, INSTANCE_UPDATING).putAll(1, INSTANCE_UPDATING);
+    assertState(ROLLING_FORWARD, actions.build());
+    changeState(JOB, 0, FINISHED, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 1, FINISHED, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+
+    actions.put(0, INSTANCE_UPDATED).put(1, INSTANCE_UPDATED);
+
+    // Update should now be paused
+    assertState(ROLL_FORWARD_PAUSED, actions.build());
+
+    // Continue the update
+    updater.resume(UPDATE_ID, AUDIT);
+
+    actions.put(2, INSTANCE_UPDATING);
+
+    assertState(ROLLING_FORWARD, actions.build());
+
+    // Instance 2 is updated.
+    changeState(JOB, 2, FINISHED, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+    actions.put(2, INSTANCE_UPDATED);
+
+    assertState(ROLLED_FORWARD, actions.build());
+
+    assertJobState(
+        JOB,
+        ImmutableMap.of(0, NEW_CONFIG, 1, NEW_CONFIG, 2, NEW_CONFIG));
+  }
+
+  @Test
+  public void testSuccessfulVarBatchUpdateAutoPause() throws Exception {
+    expectTaskKilled().times(6);
+
+    control.replay();
+
+    JobUpdate builder = makeJobUpdate(makeInstanceConfig(0, 5, OLD_CONFIG)).newBuilder();
+    builder.getInstructions().getSettings()
+        .setUpdateStrategy(
+            JobUpdateStrategy.varBatchStrategy(
+                new VariableBatchJobUpdateStrategy()
+                    .setGroupSizes(ImmutableList.of(1, 2, 3))
+                    .setAutopauseAfterBatch(true)));
+    IJobUpdate update = setInstanceCount(IJobUpdate.build(builder), 6);
+    insertInitialTasks(update);
+
+    for (int i = 0; i <= 5; ++i) {
+      changeState(JOB, i, ASSIGNED, STARTING, RUNNING);
+    }
+    clock.advance(WATCH_TIMEOUT);
+
+    ImmutableMultimap.Builder<Integer, JobUpdateAction> actions = ImmutableMultimap.builder();
+
+    // First batch is updated
+    updater.start(update, AUDIT);
+    actions.put(0, INSTANCE_UPDATING);
+    assertState(ROLLING_FORWARD, actions.build());
+    changeState(JOB, 0, FINISHED, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+
+    actions.put(0, INSTANCE_UPDATED);
+
+    // Update should now be paused after first batch is done.
+    assertState(ROLL_FORWARD_PAUSED, actions.build());
+    updater.resume(UPDATE_ID, AUDIT);
+
+    actions.put(1, INSTANCE_UPDATING).put(2, INSTANCE_UPDATING);
+    assertState(ROLLING_FORWARD, actions.build());
+
+    // Second batch is moving forward.
+    // Make instance 1 the instance that waits for final transition to SUCCEED
+    changeState(JOB, 2, FINISHED, ASSIGNED, STARTING, RUNNING);
+    clock.advance(Amount.of(WATCH_TIMEOUT.getValue() / 2, Time.MILLISECONDS));
+    changeState(JOB, 1, FINISHED, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+
+    actions.put(1, INSTANCE_UPDATED);
+    actions.put(2, INSTANCE_UPDATED);
+
+    // Second autoPause at second barrier
+    assertState(ROLL_FORWARD_PAUSED, actions.build());
+
+    updater.resume(UPDATE_ID, AUDIT);
+    actions.put(3, INSTANCE_UPDATING).put(4, INSTANCE_UPDATING).put(5, INSTANCE_UPDATING);
+
+    assertState(ROLLING_FORWARD, actions.build());
+
+    // Third batch is moving forward.
+    changeState(JOB, 3, FINISHED, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 4, FINISHED, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 5, FINISHED, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+
+    actions.put(3, INSTANCE_UPDATED).put(4, INSTANCE_UPDATED).put(5, INSTANCE_UPDATED);
+
+    assertState(ROLLED_FORWARD, actions.build());
+
+    assertJobState(
+        JOB,
+        ImmutableMap.<Integer, ITaskConfig>builder()
+            .put(0, NEW_CONFIG)
+            .put(1, NEW_CONFIG)
+            .put(2, NEW_CONFIG)
+            .put(3, NEW_CONFIG)
+            .put(4, NEW_CONFIG)
+            .put(5, NEW_CONFIG)
+            .build());
+  }
+
+  @Test
+  public void testSuccessfulVarBatchUpdateAutoPauseWithRollback() throws Exception {
+    expectTaskKilled().times(4);
+
+    control.replay();
+
+    // This update will add an instances and update two instances
+    JobUpdate builder = makeJobUpdate(makeInstanceConfig(0, 1, OLD_CONFIG)).newBuilder();
+    builder.getInstructions().getSettings()
+        .setMaxFailedInstances(0)
+        .setUpdateStrategy(
+            JobUpdateStrategy.varBatchStrategy(
+                new VariableBatchJobUpdateStrategy()
+                    .setGroupSizes(ImmutableList.of(1, 2))
+                    .setAutopauseAfterBatch(true)));
+    IJobUpdate update = setInstanceCount(IJobUpdate.build(builder), 3);
+    insertInitialTasks(update);
+
+    // Only have two instances so that one has to be added to test the add instance feature
+    // of this strategy
+    changeState(JOB, 0, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 1, ASSIGNED, STARTING, RUNNING);
+
+    clock.advance(WATCH_TIMEOUT);
+
+    ImmutableMultimap.Builder<Integer, JobUpdateAction> actions = ImmutableMultimap.builder();
+
+    // First batch is updated, Instance will be created
+    updater.start(update, AUDIT);
+    actions.put(2, INSTANCE_UPDATING);
+    assertState(ROLLING_FORWARD, actions.build());
+    changeState(JOB, 2, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+
+    actions.put(2, INSTANCE_UPDATED);
+
+    // Update should now be paused after first batch is done.
+    assertState(ROLL_FORWARD_PAUSED, actions.build());
+    updater.resume(UPDATE_ID, AUDIT);
+
+    actions.put(0, INSTANCE_UPDATING).put(1, INSTANCE_UPDATING);
+    assertState(ROLLING_FORWARD, actions.build());
+
+    // Move on to batch two
+    changeState(JOB, 0, KILLED, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+
+    // Trigger a rollback job half way through by failing task 1
+    changeState(JOB, 1, FINISHED, ASSIGNED, STARTING, RUNNING);
+    clock.advance(FLAPPING_THRESHOLD);
+    changeState(JOB, 1, FAILED);
+
+    actions.putAll(0, INSTANCE_UPDATED, INSTANCE_ROLLING_BACK)
+        .putAll(1, INSTANCE_UPDATE_FAILED, INSTANCE_ROLLING_BACK);
+
+    assertState(ROLLING_BACK, actions.build());
+    assertLatestUpdateMessage(JobUpdateControllerImpl.failureMessage(1, Failure.EXITED));
+
+    // Rollback Instances 0 and 1
+    changeState(JOB, 0, KILLED, ASSIGNED, STARTING, RUNNING);
+    changeState(JOB, 1, ASSIGNED, STARTING, RUNNING);
+    clock.advance(WATCH_TIMEOUT);
+
+    actions.put(0, INSTANCE_ROLLED_BACK).put(1, INSTANCE_ROLLED_BACK).put(2, INSTANCE_ROLLING_BACK);
+    assertState(ROLLING_BACK, actions.build());
+
+    // Rollback instance 2
+    changeState(JOB, 2, KILLED);
+    actions.put(2, INSTANCE_ROLLED_BACK);
+
+    clock.advance(WATCH_TIMEOUT);
+
+    assertState(ROLLED_BACK, actions.build());
+
+    assertJobState(
+        JOB,
+        ImmutableMap.<Integer, ITaskConfig>builder()
+            .put(0, OLD_CONFIG)
+            .put(1, OLD_CONFIG)
+            .build());
+  }
+
+  private Collection<IScheduledTask> getTasksInState(IJobKey job, ScheduleStatus status) {
+    return storage.write(storeProvider ->
+        storeProvider.getTaskStore().fetchTasks(Query.jobScoped(job).byStatus(status)));
+  }
+
   private static IJobUpdateSummary makeUpdateSummary(IJobUpdateKey key) {
     return IJobUpdateSummary.build(new JobUpdateSummary()
         .setUser("user")
@@ -1530,14 +2043,23 @@ public class JobUpdaterIT extends EasyMockTest {
   }
 
   private static IJobUpdate makeJobUpdate(IInstanceTaskConfig... configs) {
+    return makeJobUpdate(1, NEW_CONFIG, configs);
+  }
+
+  private static IJobUpdate makeJobUpdate(int updateGroupSize,
+                                          ITaskConfig newConfig,
+                                          IInstanceTaskConfig... configs) {
+
     JobUpdate builder = new JobUpdate()
         .setSummary(makeUpdateSummary(UPDATE_ID).newBuilder().setMetadata(METADATA))
         .setInstructions(new JobUpdateInstructions()
             .setDesiredState(new InstanceTaskConfig()
-                .setTask(NEW_CONFIG.newBuilder())
+                .setTask(newConfig.newBuilder())
                 .setInstances(ImmutableSet.of(new Range(0, 2))))
             .setSettings(new JobUpdateSettings()
-                .setUpdateGroupSize(1)
+                .setUpdateStrategy(
+                    JobUpdateStrategy.queueStrategy(
+                        new QueueJobUpdateStrategy().setGroupSize(updateGroupSize)))
                 .setRollbackOnFailure(true)
                 .setMinWaitInInstanceRunningMs(WATCH_TIMEOUT.as(Time.MILLISECONDS).intValue())
                 .setUpdateOnlyTheseInstances(ImmutableSet.of())));

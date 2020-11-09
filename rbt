@@ -16,7 +16,7 @@
 set -e
 
 HERE=$(cd `dirname "${BASH_SOURCE[0]}"` && pwd)
-RBTOOLS_VERSION=0.7.5
+RBTOOLS_VERSION=0.7.11
 if ! [ -f "$HERE/build-support/rbt.venv/BOOTSTRAPPED" ] || \
     [ x`cat "$HERE/build-support/rbt.venv/BOOTSTRAPPED"` != x$RBTOOLS_VERSION ]; then
 
@@ -24,7 +24,7 @@ if ! [ -f "$HERE/build-support/rbt.venv/BOOTSTRAPPED" ] || \
   rm -fr "$HERE/build-support/rbt.venv"
   "$HERE/build-support/virtualenv" "$HERE/build-support/rbt.venv"
   source "$HERE/build-support/rbt.venv/bin/activate"
-  python -m pip install --use-wheel "RBTools==$RBTOOLS_VERSION"
+  python -m pip install "RBTools==$RBTOOLS_VERSION"
   echo $RBTOOLS_VERSION > "$HERE/build-support/rbt.venv/BOOTSTRAPPED"
 fi
 source "$HERE/build-support/rbt.venv/bin/activate"

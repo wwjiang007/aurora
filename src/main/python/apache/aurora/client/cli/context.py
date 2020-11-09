@@ -148,7 +148,7 @@ class AuroraCommandContext(Context):
     """Loads a job configuration if provided."""
     return self.get_job_config(jobkey, config_file) if config_file is not None else None
 
-  def get_job_config(self, jobkey, config_file):
+  def get_job_config(self, jobkey, config_file, use_memoized_env=False):
     """Loads a job configuration from a config file."""
     jobname = jobkey.name
     try:
@@ -163,7 +163,8 @@ class AuroraCommandContext(Context):
           self.options.bindings,
           select_cluster=jobkey.cluster,
           select_role=jobkey.role,
-          select_env=jobkey.env)
+          select_env=jobkey.env,
+          use_memoized_env=use_memoized_env)
       check_result = result.raw().check()
       if not check_result.ok():
         raise self.CommandError(EXIT_INVALID_CONFIGURATION, check_result)
@@ -244,3 +245,19 @@ class AuroraCommandContext(Context):
       raise self.CommandError(EXIT_INVALID_PARAMETER,
           "Invalid instance parameter: %s" % (list(unrecognized)))
     return active
+
+  def has_count_or_percentage_sla_policy(self, key):
+    """Returns true if any of the tasks has count or percentage sla policy, false otherwise.
+
+    :param key: Job key
+    :type key: AuroraJobKey
+    :return: true if any of the tasks has count or percentage sla policy, false otherwise.
+    """
+    for task in self.get_active_tasks(key):
+      if task.assignedTask.task.slaPolicy:
+        if task.assignedTask.task.slaPolicy.percentageSlaPolicy:
+          return True
+        if task.assignedTask.task.slaPolicy.countSlaPolicy:
+          return True
+
+    return False

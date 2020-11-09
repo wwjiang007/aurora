@@ -63,9 +63,11 @@ import org.apache.aurora.gen.ResourceAggregate;
 import org.apache.aurora.gen.Response;
 import org.apache.aurora.gen.Result;
 import org.apache.aurora.gen.ScheduleStatus;
+import org.apache.aurora.gen.SlaPolicy;
 import org.apache.aurora.gen.StartJobUpdateResult;
 import org.apache.aurora.gen.StartMaintenanceResult;
 import org.apache.aurora.gen.TaskQuery;
+import org.apache.aurora.gen.VariableBatchJobUpdateStrategy;
 import org.apache.aurora.scheduler.base.JobKeys;
 import org.apache.aurora.scheduler.base.Numbers;
 import org.apache.aurora.scheduler.base.Query;
@@ -76,11 +78,11 @@ import org.apache.aurora.scheduler.configuration.SanitizedConfiguration;
 import org.apache.aurora.scheduler.cron.CronException;
 import org.apache.aurora.scheduler.cron.CronJobManager;
 import org.apache.aurora.scheduler.cron.SanitizedCronJob;
+import org.apache.aurora.scheduler.maintenance.MaintenanceController;
 import org.apache.aurora.scheduler.quota.QuotaCheckResult;
 import org.apache.aurora.scheduler.quota.QuotaManager;
 import org.apache.aurora.scheduler.quota.QuotaManager.QuotaException;
 import org.apache.aurora.scheduler.reconciliation.TaskReconciler;
-import org.apache.aurora.scheduler.state.MaintenanceController;
 import org.apache.aurora.scheduler.state.StateChangeResult;
 import org.apache.aurora.scheduler.state.StateManager;
 import org.apache.aurora.scheduler.state.UUIDGenerator;
@@ -156,6 +158,8 @@ class SchedulerThriftInterface implements AnnotatedAuroraAdmin {
   @VisibleForTesting
   static final String DRAIN_HOSTS = STAT_PREFIX + "drainHosts";
   @VisibleForTesting
+  static final String SLA_DRAIN_HOSTS = STAT_PREFIX + "slaDrainHosts";
+  @VisibleForTesting
   static final String MAINTENANCE_STATUS = STAT_PREFIX + "maintenanceStatus";
   @VisibleForTesting
   static final String END_MAINTENANCE = STAT_PREFIX + "endMaintenance";
@@ -190,6 +194,7 @@ class SchedulerThriftInterface implements AnnotatedAuroraAdmin {
   private final AtomicLong restartShardsCounter;
   private final AtomicLong startMaintenanceCounter;
   private final AtomicLong drainHostsCounter;
+  private final AtomicLong slaDrainHostsCounter;
   private final AtomicLong maintenanceStatusCounter;
   private final AtomicLong endMaintenanceCounter;
   private final AtomicLong addInstancesCounter;
@@ -237,6 +242,7 @@ class SchedulerThriftInterface implements AnnotatedAuroraAdmin {
     this.restartShardsCounter = statsProvider.makeCounter(RESTART_SHARDS);
     this.startMaintenanceCounter = statsProvider.makeCounter(START_MAINTENANCE);
     this.drainHostsCounter = statsProvider.makeCounter(DRAIN_HOSTS);
+    this.slaDrainHostsCounter = statsProvider.makeCounter(SLA_DRAIN_HOSTS);
     this.maintenanceStatusCounter = statsProvider.makeCounter(MAINTENANCE_STATUS);
     this.endMaintenanceCounter = statsProvider.makeCounter(END_MAINTENANCE);
     this.addInstancesCounter = statsProvider.makeCounter(ADD_INSTANCES);
@@ -586,6 +592,14 @@ class SchedulerThriftInterface implements AnnotatedAuroraAdmin {
   }
 
   @Override
+  public Response slaDrainHosts(Hosts hosts, SlaPolicy defaultSlaPolicy, long timeoutSecs) {
+    slaDrainHostsCounter.addAndGet(hosts.getHostNamesSize());
+    return ok(Result.drainHostsResult(
+        new DrainHostsResult().setStatuses(IHostStatus.toBuildersSet(
+            maintenance.slaDrain(hosts.getHostNames(), defaultSlaPolicy, timeoutSecs)))));
+  }
+
+  @Override
   public Response forceTaskState(String taskId, ScheduleStatus status) {
     checkNotBlank(taskId);
     requireNonNull(status);
@@ -779,9 +793,33 @@ class SchedulerThriftInterface implements AnnotatedAuroraAdmin {
       return invalidRequest(NON_SERVICE_TASK);
     }
 
+    int totalInstancesFromGroups;
     JobUpdateSettings settings = requireNonNull(mutableRequest.getSettings());
-    if (settings.getUpdateGroupSize() <= 0) {
-      return invalidRequest(INVALID_GROUP_SIZE);
+
+    // Gracefully handle a client sending an update with an older thrift schema
+    // TODO(rdelvalle): Remove after version 0.22.0 ships
+    ThriftBackfill.backfillUpdateStrategy(settings);
+
+    // Keep old job schema in case we want to revert to a lower version of Aurora that doesn't
+    // support variable update group sizes
+    if (settings.getUpdateStrategy().isSetQueueStrategy()) {
+      totalInstancesFromGroups = settings.getUpdateStrategy().getQueueStrategy().getGroupSize();
+    } else if (settings.getUpdateStrategy().isSetBatchStrategy()) {
+      totalInstancesFromGroups = settings.getUpdateStrategy().getBatchStrategy().getGroupSize();
+    } else if (settings.getUpdateStrategy().isSetVarBatchStrategy()) {
+      VariableBatchJobUpdateStrategy strategy = settings.getUpdateStrategy().getVarBatchStrategy();
+
+      if (strategy.getGroupSizes().stream().anyMatch(x -> x <= 0)) {
+        return invalidRequest(INVALID_GROUP_SIZE);
+      }
+
+      totalInstancesFromGroups = strategy.getGroupSizes().stream().reduce(0, Integer::sum);
+    } else {
+      return invalidRequest(UNKNOWN_UPDATE_STRATEGY);
+    }
+
+    if (totalInstancesFromGroups <= 0) {
+      return invalidRequest(NO_INSTANCES_MODIFIED);
     }
 
     if (settings.getMaxPerInstanceFailures() < 0) {
@@ -805,11 +843,18 @@ class SchedulerThriftInterface implements AnnotatedAuroraAdmin {
       return invalidRequest(INVALID_PULSE_TIMEOUT);
     }
 
+    if (settings.isSlaAware() && !mutableRequest.getTaskConfig().isSetSlaPolicy()) {
+      return invalidRequest(INVALID_SLA_AWARE_UPDATE);
+    }
+
     IJobUpdateRequest request;
     try {
-      request = IJobUpdateRequest.build(new JobUpdateRequest(mutableRequest).setTaskConfig(
-          configurationManager.validateAndPopulate(
-              ITaskConfig.build(mutableRequest.getTaskConfig())).newBuilder()));
+      request = IJobUpdateRequest.build(
+          new JobUpdateRequest(mutableRequest)
+              .setTaskConfig(configurationManager.validateAndPopulate(
+                  ITaskConfig.build(mutableRequest.getTaskConfig()),
+                  mutableRequest.getInstanceCount())
+              .newBuilder()));
     } catch (TaskDescriptionException e) {
       return error(INVALID_REQUEST, e);
     }
@@ -1027,10 +1072,13 @@ class SchedulerThriftInterface implements AnnotatedAuroraAdmin {
   static final String NO_CRON = "Cron jobs may only be created/updated by calling scheduleCronJob.";
 
   @VisibleForTesting
+  static final String NO_INSTANCES_MODIFIED = "Update results in no instance being modified.";
+
+  @VisibleForTesting
   static final String NON_SERVICE_TASK = "Updates are not supported for non-service tasks.";
 
   @VisibleForTesting
-  static final String INVALID_GROUP_SIZE = "updateGroupSize must be positive.";
+  static final String INVALID_GROUP_SIZE = "All update group sizes must be positive.";
 
   @VisibleForTesting
   static final String INVALID_MAX_FAILED_INSTANCES = "maxFailedInstances must be non-negative.";
@@ -1055,4 +1103,11 @@ class SchedulerThriftInterface implements AnnotatedAuroraAdmin {
 
   @VisibleForTesting
   static final String INVALID_INSTANCE_COUNT = "Instance count must be positive.";
+
+  @VisibleForTesting
+  static final String UNKNOWN_UPDATE_STRATEGY = "Update strategy provided is unknown.";
+
+  @VisibleForTesting
+  static final String INVALID_SLA_AWARE_UPDATE = "slaAware is true, but no task slaPolicy is "
+      + "specified.";
 }

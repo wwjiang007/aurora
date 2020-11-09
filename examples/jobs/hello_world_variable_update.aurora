@@ -1,3 +1,4 @@
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -9,23 +10,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
 
-[Unit]
-Description=Aurora Thermos Observer
-After=network.target
-Wants=network.target
+hello = Process(
+  name = 'hello',
+  cmdline = """
+    while true; do
+      echo hello world
+      sleep 10
+    done
+  """)
 
-[Service]
-ExecStart=/home/vagrant/aurora/dist/thermos_observer.pex \
-  --ip=192.168.33.7 \
-  --port=1338 \
-  --log_to_disk=NONE \
-  --log_to_stderr=google:INFO
-User=root
-Group=root
-Restart=always
-RestartSec=20
-LimitNOFILE=16384
+task = SequentialTask(
+  processes = [hello],
+  resources = Resources(cpu = .10, ram = 8*MB, disk = 8*MB))
 
-[Install]
-WantedBy=multi-user.target
+jobs = [
+  Service(
+    task = task,
+    cluster = 'devcluster',
+    role = 'www-data',
+    environment = 'prod',
+    name = 'hello',
+    instances = 6,
+    update_config = UpdateConfig(
+        update_strategy = VariableBatchUpdateStrategy(batch_sizes = [1, 2, 3]))
+  )
+]

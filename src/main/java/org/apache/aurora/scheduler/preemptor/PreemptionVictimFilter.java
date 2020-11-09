@@ -17,13 +17,14 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.StreamSupport;
 
 import javax.inject.Inject;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.base.Predicate;
-import com.google.common.collect.FluentIterable;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Ordering;
@@ -125,56 +126,26 @@ public interface PreemptionVictimFilter {
         };
 
     /**
-     * A Resources object is greater than another iff _all_ of its resource components are greater.
-     * A Resources object compares as equal if some but not all components are greater
-     * than or equal to the other.
+     * We compare ResourceBags lexicographically according to the order of ResourceType enum
+     * declarations. This ensures we have a deterministic order that does not break any Java
+     * sorting algorithms.
+     *
+     * TODO(serb) Consider refactoring and re-using the OfferOrderBuilder here
      */
     @VisibleForTesting
     static final Ordering<ResourceBag> ORDER = new Ordering<ResourceBag>() {
       @Override
       public int compare(ResourceBag left, ResourceBag right) {
-        Set<ResourceType> types = ImmutableSet.<ResourceType>builder()
-            .addAll(left.streamResourceVectors().map(e -> e.getKey()).iterator())
-            .addAll(right.streamResourceVectors().map(e -> e.getKey()).iterator())
-            .build();
-
-        boolean allZero = true;
-        boolean allGreaterOrEqual = true;
-        boolean allLessOrEqual = true;
-
-        for (ResourceType type : types) {
+        for (ResourceType type : ResourceType.values()) {
           int compare = Double.compare(left.valueOf(type), right.valueOf(type));
           if (compare != 0) {
-            allZero = false;
-          }
-
-          if (compare < 0) {
-            allGreaterOrEqual = false;
-          }
-
-          if (compare > 0) {
-            allLessOrEqual = false;
+            return compare;
           }
         }
-
-        if (allZero) {
-          return 0;
-        }
-
-        if (allGreaterOrEqual) {
-          return 1;
-        }
-
-        if (allLessOrEqual) {
-          return -1;
-        }
-
         return 0;
       }
     };
 
-    // TODO(zmanji) Consider using Dominant Resource Fairness for ordering instead of the vector
-    // ordering
     private final Ordering<PreemptionVictim> resourceOrder =
         ORDER.onResultOf(victimToResources).reverse();
 
@@ -186,6 +157,15 @@ public interface PreemptionVictimFilter {
         Optional<HostOffer> offer,
         StoreProvider storeProvider) {
 
+      List<PreemptionVictim> sortedVictims = StreamSupport
+          .stream(possibleVictims.spliterator(), false)
+          .filter(preemptionFilter(pendingTask))
+          .sorted(resourceOrder)
+          .collect(ImmutableList.toImmutableList());
+      if (sortedVictims.isEmpty()) {
+        return Optional.empty();
+      }
+
       // This enforces the precondition that all of the resources are from the same host. We need to
       // get the host for the schedulingFilter.
       Set<String> hosts = ImmutableSet.<String>builder()
@@ -193,24 +173,12 @@ public interface PreemptionVictimFilter {
           .addAll(offer.map(OFFER_TO_HOST).map(ImmutableSet::of).orElse(ImmutableSet.of()))
           .build();
 
-      ResourceBag slackResources = offer.map(ImmutableSet::of).orElse(ImmutableSet.of()).stream()
+      ResourceBag slackResources = offer
           .map(o -> bagFromMesosResources(getNonRevocableOfferResources(o.getOffer())))
-          .reduce((l, r) -> l.add(r))
           .orElse(EMPTY);
-
-      FluentIterable<PreemptionVictim> preemptableTasks = FluentIterable.from(possibleVictims)
-          .filter(preemptionFilter(pendingTask));
-
-      List<PreemptionVictim> sortedVictims = resourceOrder.immutableSortedCopy(preemptableTasks);
-      if (sortedVictims.isEmpty()) {
-        return Optional.empty();
-      }
-
-      Set<PreemptionVictim> toPreemptTasks = Sets.newHashSet();
 
       Optional<IHostAttributes> attributes =
           storeProvider.getAttributeStore().getHostAttributes(Iterables.getOnlyElement(hosts));
-
       if (!attributes.isPresent()) {
         metrics.recordMissingAttributes();
         return Optional.empty();
@@ -219,15 +187,13 @@ public interface PreemptionVictimFilter {
       ResourceRequest requiredResources =
           ResourceRequest.fromTask(pendingTask, executorSettings, jobState, tierManager);
 
+      Optional<Instant> unavailability = offer.flatMap(HostOffer::getUnavailabilityStart);
+
       ResourceBag totalResource = slackResources;
+      Set<PreemptionVictim> toPreemptTasks = Sets.newHashSet();
       for (PreemptionVictim victim : sortedVictims) {
         toPreemptTasks.add(victim);
         totalResource = totalResource.add(victimToResources.apply(victim));
-
-        Optional<Instant> unavailability = Optional.empty();
-        if (offer.isPresent()) {
-          unavailability = offer.get().getUnavailabilityStart();
-        }
 
         Set<Veto> vetoes = schedulingFilter.filter(
             new UnusedResource(totalResource, attributes.get(), unavailability),
@@ -237,6 +203,7 @@ public interface PreemptionVictimFilter {
           return Optional.of(ImmutableSet.copyOf(toPreemptTasks));
         }
       }
+
       return Optional.empty();
     }
 
@@ -245,7 +212,7 @@ public interface PreemptionVictimFilter {
      *
      * @param pendingTask A task that is not scheduled to possibly preempt other tasks for.
      * @return A filter that will compare the priorities and resources required by other tasks
-     *     with {@code preemptableTask}.
+     *     with {@code preemptibleTask}.
      */
     private Predicate<PreemptionVictim> preemptionFilter(final ITaskConfig pendingTask) {
       return possibleVictim -> {

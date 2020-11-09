@@ -19,10 +19,13 @@ import mock
 import pytest
 from twitter.common.quantity import Amount, Time
 
+from apache.thermos.monitoring.disk import DuDiskCollector, MesosDiskCollector
 from apache.thermos.monitoring.monitor import TaskMonitor
 from apache.thermos.monitoring.process import ProcessSample
 from apache.thermos.monitoring.resource import (
+    DiskCollectorProvider,
     HistoryProvider,
+    NullTaskResourceMonitor,
     ResourceHistory,
     ResourceMonitorBase,
     TaskResourceMonitor
@@ -35,6 +38,16 @@ class TestResourceHistoryProvider(TestCase):
   def test_too_long_history(self):
     with pytest.raises(ValueError):
       HistoryProvider().provides(Amount(1, Time.DAYS), 1)
+
+
+class TestDiskCollectorProvider(TestCase):
+  def test_default_collector_class(self):
+    assert isinstance(DiskCollectorProvider().provides("some_path"), DuDiskCollector)
+
+  def test_mesos_collector_class(self):
+    assert isinstance(
+      DiskCollectorProvider(enable_mesos_disk_collector=True).provides("some_path"),
+      MesosDiskCollector)
 
 
 class TestResourceHistory(TestCase):
@@ -142,3 +155,17 @@ class TestTaskResourceMonitor(TestCase):
       task_resource_monitor.sample_by_process('fake-process-name')
 
     assert mock_get_active_processes.mock_calls == [mock.call(task_monitor)]
+
+
+class TestNullTaskResourceMonitor(TestCase):
+  def test_null_sample(self):
+    monitor = NullTaskResourceMonitor()
+    monitor.start()
+
+    null_aggregate = (0, ProcessSample.empty(), 0)
+
+    assert monitor.sample()[1] == null_aggregate
+    assert monitor.sample_at(time())[1] == null_aggregate
+    assert monitor.sample_by_process("any_process") == ProcessSample.empty()
+
+    monitor.kill()

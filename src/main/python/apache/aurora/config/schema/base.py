@@ -19,6 +19,8 @@ from pystachio import Choice
 
 from apache.thermos.config.schema import *
 
+from gen.apache.aurora.api.constants import AURORA_EXECUTOR_NAME
+
 
 # TODO(wickman) Bind {{mesos.instance}} to %shard_id%
 class MesosContext(Struct):
@@ -26,6 +28,16 @@ class MesosContext(Struct):
   instance    = Required(Integer)
   hostname    = Required(String)
 
+class QueueUpdateStrategy(Struct):
+  batch_size = Default(Integer, 1)
+
+class BatchUpdateStrategy(Struct):
+  batch_size = Default(Integer, 1)
+  autopause_after_batch = Default(Boolean, False)
+
+class VariableBatchUpdateStrategy(Struct):
+  batch_sizes = Required(List(Integer))
+  autopause_after_batch = Default(Boolean, False)
 
 class UpdateConfig(Struct):
   batch_size                  = Default(Integer, 1)
@@ -35,6 +47,10 @@ class UpdateConfig(Struct):
   rollback_on_failure         = Default(Boolean, True)
   wait_for_batch_completion   = Default(Boolean, False)
   pulse_interval_secs         = Integer
+  sla_aware                   = Default(Boolean, False)
+  update_strategy             = Choice([QueueUpdateStrategy,
+                                        BatchUpdateStrategy,
+                                        VariableBatchUpdateStrategy])
 
 
 class HttpHealthChecker(Struct):
@@ -163,6 +179,25 @@ class Metadata(Struct):
   key   = Required(String)
   value = Required(String)
 
+class ExecutorConfig(Struct):
+  name = Default(String, AURORA_EXECUTOR_NAME)
+  data = Default(String, "")
+
+
+class PercentageSlaPolicy(Struct):
+  percentage = Required(Float)
+  duration_secs = Required(Integer)
+
+
+class CountSlaPolicy(Struct):
+  count = Required(Integer)
+  duration_secs = Required(Integer)
+
+
+class CoordinatorSlaPolicy(Struct):
+  coordinator_url = Required(String)
+  status_key = Default(String, "drain")
+
 
 class MesosJob(Struct):
   name          = Default(String, '{{task.name}}')
@@ -190,10 +225,12 @@ class MesosJob(Struct):
   # TODO(wickman) Make Default(Any, LifecycleConfig()) once pystachio #17 is addressed.
   lifecycle                  = Default(LifecycleConfig, DefaultLifecycleConfig)
   task_links                 = Map(String, String)  # Unsupported.  See AURORA-739
+  executor_config            = Default(ExecutorConfig, ExecutorConfig())
 
   enable_hooks = Default(Boolean, False)  # enable client API hooks; from env python-list 'hooks'
 
   partition_policy = PartitionPolicy
+  sla_policy = Choice([CoordinatorSlaPolicy, CountSlaPolicy, PercentageSlaPolicy])
 
   # Specifying a `Container` with a `docker` property for Docker jobs is deprecated, instead just
   # specify the value of the container property to be a `Docker` container directly.
